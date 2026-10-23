@@ -21,8 +21,13 @@ flate2 = "1.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 clap = { version = "4.6", features = ["derive", "cargo"] }
-eframe = "0.37"
+eframe = { version = "0.37", features = ["persistence"] }
+fontique = "0.11.1"
+sys-locale = "0.3"
 rfd = "0.17"
+
+[dev-dependencies]
+ron = "0.12"
 
 [build-dependencies]
 cc = "1.10"

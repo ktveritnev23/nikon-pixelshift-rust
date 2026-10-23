@@ -1,10 +1,12 @@
 //! egui drawing code: panels, canvas and the preview texture cache.
 
+use crate::app::i18n::Lang;
 use crate::app::model::{
     clamp_center, fit_zoom, lod_level, visible_rect, Compression, GuiState, LodLevel, OutFormat,
-    PreviewSlot, Request, ScaleMode, ViewSource, MAX_PREVIEW_DIM, MAX_ZOOM, MIN_ZOOM,
+    PreviewSlot, Request, ScaleMode, Stage, ViewSource, MAX_PREVIEW_DIM, MAX_ZOOM, MIN_ZOOM,
 };
 use crate::app::pipeline::{self, ResultInfo};
+use crate::app::prefs::UiPrefs;
 use crate::app::worker::Mode;
 use crate::write::DngFlavor;
 use eframe::egui;
@@ -21,15 +23,10 @@ pub struct PreviewCache {
 impl PreviewCache {
     fn texture(&mut self, ctx: &egui::Context, slot: &PreviewSlot) -> &egui::TextureHandle {
         if self.key != slot.generation || self.handle.is_none() {
-            let image = egui::ColorImage::from_rgb(
-                [slot.image.width, slot.image.height],
-                &slot.image.rgb,
-            );
-            self.handle = Some(ctx.load_texture(
-                "pixelshift-preview",
-                image,
-                egui::TextureOptions::LINEAR,
-            ));
+            let image =
+                egui::ColorImage::from_rgb([slot.image.width, slot.image.height], &slot.image.rgb);
+            self.handle =
+                Some(ctx.load_texture("pixelshift-preview", image, egui::TextureOptions::LINEAR));
             self.key = slot.generation;
             self.size = (slot.image.width, slot.image.height);
         }
@@ -37,7 +34,13 @@ impl PreviewCache {
     }
 }
 
-pub fn draw(state: &mut GuiState, cache: &mut PreviewCache, ui: &mut egui::Ui) {
+/// Draw one frame; true when a preference changed and must be re-applied.
+pub fn draw(
+    state: &mut GuiState,
+    cache: &mut PreviewCache,
+    prefs: &mut UiPrefs,
+    ui: &mut egui::Ui,
+) -> bool {
     let has_result = state
         .selected_series()
         .map(|series| series.result.is_some())
@@ -47,43 +50,65 @@ pub fn draw(state: &mut GuiState, cache: &mut PreviewCache, ui: &mut egui::Ui) {
             distort: state.options.distort,
         });
     }
-    let _ = egui::Panel::top("pixelshift-top").show(ui, |ui| top_bar(state, ui));
+    let mut changed = false;
+    let _ = egui::Panel::top("pixelshift-top").show(ui, |ui| {
+        changed |= top_bar(state, prefs, ui);
+    });
+    let lang = prefs.lang;
     let _ = egui::Panel::left("pixelshift-left")
         .resizable(true)
         .default_size(370.0)
-        .show(ui, |ui| left_panel(state, ui));
+        .show(ui, |ui| left_panel(state, lang, ui));
     let _ = egui::Panel::bottom("pixelshift-bottom")
         .resizable(true)
         .default_size(150.0)
-        .show(ui, |ui| bottom_panel(state, ui));
-    let _ = egui::CentralPanel::default_margins().show(ui, |ui| canvas(state, cache, ui));
+        .show(ui, |ui| bottom_panel(state, lang, ui));
+    let _ = egui::CentralPanel::default_margins().show(ui, |ui| canvas(state, cache, lang, ui));
+    changed
 }
 
-fn top_bar(state: &mut GuiState, ui: &mut egui::Ui) {
+fn top_bar(state: &mut GuiState, prefs: &mut UiPrefs, ui: &mut egui::Ui) -> bool {
+    let lang = prefs.lang;
+    let mut prefs_changed = false;
     ui.horizontal(|ui| {
-        if ui.button("Open folder...").clicked() {
+        if ui
+            .button(lang.t("Open folder...", "Открыть папку..."))
+            .clicked()
+        {
             state.requests.push(Request::PickFolder);
         }
-        if ui.button("Open files...").clicked() {
+        if ui
+            .button(lang.t("Open files...", "Открыть файлы..."))
+            .clicked()
+        {
             state.requests.push(Request::PickFiles);
         }
         ui.separator();
         let has_series = !state.series.is_empty();
         let busy = state.stage.is_busy();
         if ui
-            .add_enabled(has_series && !busy, egui::Button::new("Merge"))
+            .add_enabled(
+                has_series && !busy,
+                egui::Button::new(lang.t("Merge", "Объединить")),
+            )
             .clicked()
         {
             state.requests.push(Request::Load);
         }
         if ui
-            .add_enabled(!state.queue.is_empty() && !state.batch_running, egui::Button::new("Start batch"))
+            .add_enabled(
+                !state.queue.is_empty() && !state.batch_running,
+                egui::Button::new(lang.t("Start batch", "Запустить очередь")),
+            )
             .clicked()
         {
             state.requests.push(Request::StartBatch);
         }
         if ui
-            .add_enabled(state.batch_running, egui::Button::new("Stop batch"))
+            .add_enabled(
+                state.batch_running,
+                egui::Button::new(lang.t("Stop batch", "Остановить очередь")),
+            )
             .clicked()
         {
             state.requests.push(Request::StopBatch);
@@ -94,10 +119,15 @@ fn top_bar(state: &mut GuiState, ui: &mut egui::Ui) {
             .map(|s| s.result.is_some())
             .unwrap_or(false);
         if ui
-            .add_enabled(has_result, egui::Button::new("Save..."))
+            .add_enabled(
+                has_result,
+                egui::Button::new(lang.t("Save...", "Сохранить...")),
+            )
             .clicked()
         {
-            state.requests.push(Request::SaveDialog { downsample: false });
+            state
+                .requests
+                .push(Request::SaveDialog { downsample: false });
         }
         let can_1x = has_result
             && state
@@ -106,42 +136,68 @@ fn top_bar(state: &mut GuiState, ui: &mut egui::Ui) {
                 .map(|r| r.scale > 1)
                 .unwrap_or(false);
         if ui
-            .add_enabled(can_1x, egui::Button::new("Save 1x..."))
+            .add_enabled(
+                can_1x,
+                egui::Button::new(lang.t("Save 1x...", "Сохранить 1x...")),
+            )
             .clicked()
         {
-            state.requests.push(Request::SaveDialog { downsample: true });
+            state
+                .requests
+                .push(Request::SaveDialog { downsample: true });
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("Quit").clicked() {
+            if ui.button(lang.t("Quit", "Выход")).clicked() {
                 state.requests.push(Request::Quit);
             }
-            ui.checkbox(&mut state.show_log, "log");
+            ui.checkbox(&mut state.show_log, lang.t("log", "лог"));
             ui.label(egui::RichText::new(crate::version()).weak());
+            prefs_changed |= prefs.settings_ui(ui);
         });
     });
+    prefs_changed
 }
 
-fn left_panel(state: &mut GuiState, ui: &mut egui::Ui) {
+/// Warning colour that follows the active theme: the bright warning colour in
+/// the dark theme, the same hue darkened to amber on the light panel.
+fn demo_warning_color(ui: &egui::Ui) -> Color32 {
+    let color = ui.visuals().warn_fg_color;
+    if ui.visuals().dark_mode {
+        color
+    } else {
+        Color32::from_rgb(
+            (color.r() as f32 * 0.72).round() as u8,
+            (color.g() as f32 * 0.72).round() as u8,
+            (color.b() as f32 * 0.72).round() as u8,
+        )
+    }
+}
+
+fn left_panel(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.heading("Series");
+            ui.heading(lang.t("Series", "Серии"));
             if state.mode == Mode::Demo {
-                ui.label(egui::RichText::new("demo data: fabricated frames").color(Color32::YELLOW));
+                ui.label(
+                    egui::RichText::new("demo data: fabricated frames")
+                        .color(demo_warning_color(ui)),
+                );
             }
             let mut select = None;
             for (index, series) in state.series.iter().enumerate() {
-                let text = format!(
-                    "{}  [{}]",
-                    series.info.label(),
-                    if series.loaded { "merged" } else { "idle" }
-                );
+                let status = if series.loaded {
+                    lang.t("merged", "объединено")
+                } else {
+                    lang.t("idle", "ожидает")
+                };
+                let text = format!("{}  [{status}]", series.info.label());
                 if ui.selectable_label(index == state.selected, text).clicked() {
                     select = Some(index);
                 }
             }
             if state.series.is_empty() {
-                ui.label("no series loaded");
+                ui.label(lang.t("no series loaded", "серии не загружены"));
             }
             if let Some(index) = select {
                 state.selected = index;
@@ -155,36 +211,42 @@ fn left_panel(state: &mut GuiState, ui: &mut egui::Ui) {
             let queued = state.queue.len();
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!state.series.is_empty(), egui::Button::new("queue all"))
+                    .add_enabled(
+                        !state.series.is_empty(),
+                        egui::Button::new(lang.t("queue all", "в очередь все")),
+                    )
                     .clicked()
                 {
                     state.queue = (0..state.series.len()).collect();
                 }
                 if ui
-                    .add_enabled(queued > 0, egui::Button::new("clear queue"))
+                    .add_enabled(
+                        queued > 0,
+                        egui::Button::new(lang.t("clear queue", "очистить очередь")),
+                    )
                     .clicked()
                 {
                     state.queue.clear();
                 }
-                ui.label(format!("{queued} queued"));
+                ui.label(format!("{queued} {}", lang.t("queued", "в очереди")));
             });
 
             ui.separator();
-            frames_panel(state, ui);
+            frames_panel(state, lang, ui);
             ui.separator();
-            options_panel(state, ui);
+            options_panel(state, lang, ui);
         });
 }
 
-fn frames_panel(state: &mut GuiState, ui: &mut egui::Ui) {
-    ui.heading("Frames");
+fn frames_panel(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
+    ui.heading(lang.t("Frames", "Кадры"));
     let selected_frame = state.selected_frame;
     let (frames, shifts) = match state.selected_series() {
         Some(series) => (series.frames.clone(), series.shifts.clone()),
         None => (Vec::new(), Vec::new()),
     };
     if frames.is_empty() {
-        ui.label("not decoded yet");
+        ui.label(lang.t("not decoded yet", "ещё не декодировано"));
         return;
     }
     let mut select = None;
@@ -193,7 +255,7 @@ fn frames_panel(state: &mut GuiState, ui: &mut egui::Ui) {
         .num_columns(7)
         .show(ui, |ui| {
             ui.label(egui::RichText::new("#").strong());
-            ui.label(egui::RichText::new("file").strong());
+            ui.label(egui::RichText::new(lang.t("file", "файл")).strong());
             ui.label(egui::RichText::new("dx").strong());
             ui.label(egui::RichText::new("dy").strong());
             ui.label(egui::RichText::new("rot \"").strong());
@@ -243,34 +305,38 @@ fn frames_panel(state: &mut GuiState, ui: &mut egui::Ui) {
     }
 }
 
-fn options_panel(state: &mut GuiState, ui: &mut egui::Ui) {
-    ui.heading("Options");
+fn options_panel(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
+    ui.heading(lang.t("Options", "Параметры"));
     ui.horizontal(|ui| {
-        ui.label("scale");
+        ui.label(lang.t("scale", "масштаб"));
         egui::ComboBox::from_id_salt("pixelshift-scale")
-            .selected_text(state.options.scale.label())
+            .selected_text(scale_label(lang, state.options.scale))
             .show_ui(ui, |ui| {
                 for mode in ScaleMode::ALL {
-                    ui.selectable_value(&mut state.options.scale, mode, mode.label());
+                    ui.selectable_value(&mut state.options.scale, mode, scale_label(lang, mode));
                 }
             });
-        ui.label("format");
+        ui.label(lang.t("format", "формат"));
         egui::ComboBox::from_id_salt("pixelshift-format")
-            .selected_text(state.options.format.label())
+            .selected_text(format_label(lang, state.options.format))
             .show_ui(ui, |ui| {
                 for format in OutFormat::ALL {
-                    ui.selectable_value(&mut state.options.format, format, format.label());
+                    ui.selectable_value(
+                        &mut state.options.format,
+                        format,
+                        format_label(lang, format),
+                    );
                 }
             });
     });
     ui.horizontal(|ui| {
-        ui.label("DNG main image");
+        ui.label(lang.t("DNG main image", "основное изображение DNG"));
         let mut flavor = state.options.flavor;
         egui::ComboBox::from_id_salt("pixelshift-flavor")
-            .selected_text(flavor.label())
+            .selected_text(flavor_label(lang, flavor))
             .show_ui(ui, |ui| {
                 for candidate in DngFlavor::ALL {
-                    ui.selectable_value(&mut flavor, candidate, candidate.label());
+                    ui.selectable_value(&mut flavor, candidate, flavor_label(lang, candidate));
                 }
             });
         if flavor != state.options.flavor {
@@ -279,29 +345,33 @@ fn options_panel(state: &mut GuiState, ui: &mut egui::Ui) {
             state.invalidate_crops();
         }
         if state.options.format == OutFormat::Tiff {
-            ui.checkbox(&mut state.options.tiff_render, "render sRGB");
+            ui.checkbox(
+                &mut state.options.tiff_render,
+                lang.t("render sRGB", "рендерить sRGB"),
+            );
         }
     });
     ui.label(
-        egui::RichText::new(
-            "linearraw: full colour resolution; rgb: plain 16-bit RGB;              cfa: Bayer mosaic for readers that need a raw sensor pattern",
-        )
+        egui::RichText::new(lang.t(
+            "linearraw: full colour resolution; rgb: plain 16-bit RGB; cfa: Bayer mosaic for readers that need a raw sensor pattern",
+            "linearraw: полное цветовое разрешение; rgb: обычный 16-bit RGB; cfa: мозаика Байера для программ, которым нужен сырой шаблон сенсора",
+        ))
         .small()
         .weak(),
     );
     ui.horizontal(|ui| {
-        ui.label("deconvolve");
+        ui.label(lang.t("deconvolve", "деконволюция"));
         ui.add(egui::Slider::new(&mut state.options.deconvolve, 0.0..=2.0));
     });
     ui.horizontal(|ui| {
-        ui.label("Distortion k1");
+        ui.label(lang.t("Distortion k1", "Дисторсия k1"));
         let range = -crate::distort::MAX_K1..=crate::distort::MAX_K1;
         ui.add(
             egui::Slider::new(&mut state.options.distort.k1, range)
                 .step_by(0.0001)
                 .fixed_decimals(4),
         );
-        if ui.button("reset 0").clicked() {
+        if ui.button(lang.t("reset 0", "сброс 0")).clicked() {
             state.options.distort = crate::distort::Distortion::IDENTITY;
         }
     });
@@ -321,11 +391,14 @@ fn options_panel(state: &mut GuiState, ui: &mut egui::Ui) {
         );
     });
     if ui
-        .button("Fit distortion from reference...")
-        .on_hover_text(
-            "Export one frame of the series from Capture One (or Lightroom) with \
-             its lens profile enabled, then measure k1, k2, k3 from the difference",
-        )
+        .button(lang.t(
+            "Fit distortion from reference...",
+            "Измерить дисторсию по эталону...",
+        ))
+        .on_hover_text(lang.t(
+            "Export one frame of the series from Capture One (or Lightroom) with its lens profile enabled, then measure k1, k2, k3 from the difference",
+            "Экспортируйте один кадр серии из Capture One (или Lightroom) с включённым профилем объектива, затем измерьте k1, k2, k3 по разнице",
+        ))
         .clicked()
     {
         state.requests.push(Request::PickDistortReference);
@@ -333,8 +406,17 @@ fn options_panel(state: &mut GuiState, ui: &mut egui::Ui) {
     if let Some(fit) = state.last_fit {
         ui.label(
             egui::RichText::new(format!(
-                "measured k1 {:+.5} k2 {:+.5} k3 {:+.5}, residual {:.3} px, {} blocks, max radius {:.0} px",
-                fit.k1, fit.k2, fit.k3, fit.residual_rms, fit.blocks, fit.max_radius_px
+                "{} k1 {:+.5} k2 {:+.5} k3 {:+.5}, {} {:.3} px, {} {}, {} {:.0} px",
+                lang.t("measured", "измерено"),
+                fit.k1,
+                fit.k2,
+                fit.k3,
+                lang.t("residual", "остаток"),
+                fit.residual_rms,
+                fit.blocks,
+                lang.t("blocks", "блоков"),
+                lang.t("max radius", "максимальный радиус"),
+                fit.max_radius_px
             ))
             .small()
             .weak(),
@@ -342,11 +424,12 @@ fn options_panel(state: &mut GuiState, ui: &mut egui::Ui) {
     }
     if state.options.distort.is_identity() {
         ui.label(
-            egui::RichText::new(
+            egui::RichText::new(lang.t(
                 "positive k1 removes pincushion (VILTROX needs +0.002..+0.01); a 24 mm zoom needs about -0.03",
-            )
-                .small()
-                .weak(),
+                "положительный k1 убирает подушкообразную дисторсию (VILTROX нужно +0.002..+0.01); зуму 24 мм нужно около -0.03",
+            ))
+            .small()
+            .weak(),
         );
     } else {
         let corner = state
@@ -355,7 +438,12 @@ fn options_panel(state: &mut GuiState, ui: &mut egui::Ui) {
             .unwrap_or(0.0);
         ui.label(
             egui::RichText::new(format!(
-                "positive k1 removes pincushion: corner moves {corner:.1} px, k2 {:+.4}, k3 {:+.5}",
+                "{}: {} {corner:.1} px, k2 {:+.4}, k3 {:+.5}",
+                lang.t(
+                    "positive k1 removes pincushion",
+                    "положительный k1 убирает подушкообразную дисторсию"
+                ),
+                lang.t("corner moves", "угол смещается на"),
                 state.options.distort.k2,
                 state.options.distort.k3
             ))
@@ -364,15 +452,15 @@ fn options_panel(state: &mut GuiState, ui: &mut egui::Ui) {
         );
     }
     ui.horizontal(|ui| {
-        ui.label("compression");
+        ui.label(lang.t("compression", "сжатие"));
         egui::ComboBox::from_id_salt("pixelshift-compression")
-            .selected_text(state.options.compression.label())
+            .selected_text(compression_label(lang, state.options.compression))
             .show_ui(ui, |ui| {
                 for compression in Compression::ALL {
                     ui.selectable_value(
                         &mut state.options.compression,
                         compression,
-                        compression.label(),
+                        compression_label(lang, compression),
                     );
                 }
             });
@@ -384,15 +472,30 @@ fn options_panel(state: &mut GuiState, ui: &mut egui::Ui) {
                 .color(ui.visuals().warn_fg_color),
         );
     }
-    ui.checkbox(&mut state.options.also_1x, "also write 1x");
-    ui.checkbox(&mut state.options.align, "align: translation + rotation");
+    ui.checkbox(
+        &mut state.options.also_1x,
+        lang.t("also write 1x", "также писать 1x"),
+    );
+    ui.checkbox(
+        &mut state.options.align,
+        lang.t(
+            "align: translation + rotation",
+            "выравнивание: сдвиг + поворот",
+        ),
+    );
     ui.label(
-        egui::RichText::new("sub-pixel shift and rotation estimation, per frame")
-            .small()
-            .weak(),
+        egui::RichText::new(lang.t(
+            "sub-pixel shift and rotation estimation, per frame",
+            "оценка субпиксельного сдвига и поворота для каждого кадра",
+        ))
+        .small()
+        .weak(),
     );
     let mut limited = state.options.threads.is_some();
-    if ui.checkbox(&mut limited, "limit threads").changed() {
+    if ui
+        .checkbox(&mut limited, lang.t("limit threads", "ограничить потоки"))
+        .changed()
+    {
         state.options.threads = if limited {
             Some(state.options.threads.unwrap_or(8).max(1))
         } else {
@@ -404,19 +507,29 @@ fn options_panel(state: &mut GuiState, ui: &mut egui::Ui) {
     }
 
     ui.separator();
-    ui.heading("Output");
+    ui.heading(lang.t("Output", "Вывод"));
     if let Some(series) = state.selected_series() {
         let mode = if series.info.unexpected_mode() {
-            format!("{} frames (unexpected)", series.info.frame_count())
+            format!(
+                "{} {}",
+                series.info.frame_count(),
+                lang.t("frames (unexpected)", "кадров (неожиданно)")
+            )
         } else {
-            format!("mode {}", series.info.mode)
+            format!("{} {}", lang.t("mode", "режим"), series.info.mode)
         };
-        ui.label(format!("series: {mode} -> scale {}", series.info.suggested_scale));
+        ui.label(format!(
+            "{}: {mode} -> {} {}",
+            lang.t("series", "серия"),
+            lang.t("scale", "масштаб"),
+            series.info.suggested_scale
+        ));
         if series.info.unexpected_mode() {
             ui.label(
-                egui::RichText::new(
+                egui::RichText::new(lang.t(
                     "frame count is not 4/8/16/32: pick the scale by hand",
-                )
+                    "число кадров не 4/8/16/32: выберите масштаб вручную",
+                ))
                 .small()
                 .color(ui.visuals().warn_fg_color),
             );
@@ -424,18 +537,20 @@ fn options_panel(state: &mut GuiState, ui: &mut egui::Ui) {
     }
     if let Some(estimate) = state.output_estimate() {
         ui.label(format!(
-            "{} x {}  scale {}  {:.2} MP",
+            "{} x {}  {} {}  {:.2} MP",
             estimate.width,
             estimate.height,
+            lang.t("scale", "масштаб"),
             estimate.scale,
             estimate.megapixels()
         ));
-        ui.label(output_size_line(state, &estimate));
+        ui.label(output_size_line(state, lang, &estimate));
         if let Some((needed, free)) = state.space_shortfall() {
             let _ = needed;
             ui.label(
                 egui::RichText::new(format!(
-                    "only {} free on the output volume",
+                    "{} {}",
+                    lang.t("free on the output volume:", "свободно на целевом томе:"),
                     pipeline::fmt_bytes(free)
                 ))
                 .small()
@@ -444,35 +559,96 @@ fn options_panel(state: &mut GuiState, ui: &mut egui::Ui) {
         }
     }
     ui.label(
-        egui::RichText::new(
-            "linear camera-native RGB after black subtraction (0..white-black), \
-             white balance NOT applied; AsShotNeutral and the colour matrix stay in the DNG metadata",
-        )
+        egui::RichText::new(lang.t(
+            "linear camera-native RGB after black subtraction (0..white-black), white balance NOT applied; AsShotNeutral and the colour matrix stay in the DNG metadata",
+            "линейный RGB в родном для камеры пространстве после вычитания чёрного (0..white-black), баланс белого НЕ применяется; AsShotNeutral и цветовая матрица остаются в метаданных DNG",
+        ))
         .small()
         .weak(),
     );
 }
 
-fn output_size_line(state: &GuiState, estimate: &ResultInfo) -> String {
-    let uncompressed = pipeline::fmt_bytes(estimate.bytes());
-    match (state.options.format, state.options.compression) {
-        (OutFormat::Tiff, Compression::Deflate) => format!(
-            "{} uncompressed 16-bit; deflate expected ~1.5-2x smaller",
-            uncompressed
-        ),
-        _ => format!("{} uncompressed 16-bit RGB", uncompressed),
+fn scale_label(lang: Lang, mode: ScaleMode) -> &'static str {
+    match mode {
+        ScaleMode::Auto => lang.t("auto", "авто"),
+        ScaleMode::One => "1x",
+        ScaleMode::Two => "2x",
     }
 }
 
-fn bottom_panel(state: &mut GuiState, ui: &mut egui::Ui) {
+fn format_label(lang: Lang, format: OutFormat) -> &'static str {
+    match format {
+        OutFormat::Dng => lang.t("DNG (linear)", "DNG (линейный)"),
+        OutFormat::Tiff => "TIFF 16-bit",
+    }
+}
+
+fn flavor_label(lang: Lang, flavor: DngFlavor) -> &'static str {
+    match flavor {
+        DngFlavor::LinearRaw => lang.t("linearraw (full colour)", "linearraw (полный цвет)"),
+        DngFlavor::Rgb => "rgb (16-bit RGB)",
+        DngFlavor::Cfa => lang.t("cfa (Bayer mosaic)", "cfa (мозаика Байера)"),
+    }
+}
+
+fn compression_label(lang: Lang, compression: Compression) -> &'static str {
+    match compression {
+        Compression::None => lang.t("none", "без сжатия"),
+        Compression::Deflate => "deflate",
+    }
+}
+
+fn stage_label(lang: Lang, stage: Stage) -> &'static str {
+    match stage {
+        Stage::Idle => lang.t("idle", "ожидание"),
+        Stage::Scanning => lang.t("scanning", "поиск серий"),
+        Stage::Decoding => lang.t("decoding", "декодирование"),
+        Stage::Aligning => lang.t("aligning", "выравнивание"),
+        Stage::Merging => lang.t("merging", "объединение"),
+        Stage::Previewing => lang.t("preview", "предпросмотр"),
+        Stage::Saving => lang.t("saving", "сохранение"),
+        Stage::Done => lang.t("done", "готово"),
+    }
+}
+
+fn source_label(lang: Lang, source: ViewSource) -> &'static str {
+    match source {
+        ViewSource::Merged => lang.t("Merged", "Объединённое"),
+        ViewSource::Reference => lang.t("Reference", "Эталон"),
+    }
+}
+
+fn output_size_line(state: &GuiState, lang: Lang, estimate: &ResultInfo) -> String {
+    let uncompressed = pipeline::fmt_bytes(estimate.bytes());
+    match (state.options.format, state.options.compression) {
+        (OutFormat::Tiff, Compression::Deflate) => format!(
+            "{} {}",
+            uncompressed,
+            lang.t(
+                "uncompressed 16-bit; deflate expected ~1.5-2x smaller",
+                "без сжатия, 16-bit; deflate обычно даёт файл в ~1.5-2 раза меньше",
+            )
+        ),
+        _ => format!(
+            "{} {}",
+            uncompressed,
+            lang.t("uncompressed 16-bit RGB", "без сжатия, 16-bit RGB")
+        ),
+    }
+}
+
+fn bottom_panel(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(state.stage.label()).strong());
+        ui.label(egui::RichText::new(stage_label(lang, state.stage)).strong());
         ui.add(
             egui::ProgressBar::new(state.progress)
                 .desired_width(240.0)
                 .show_percentage(),
         );
-        ui.label(format!("{:.0} ms", state.total_time().as_secs_f64() * 1000.0));
+        ui.label(format!(
+            "{:.0} ms",
+            state.total_time().as_secs_f64() * 1000.0
+        ));
         if state.crop_pending {
             ui.spinner();
         }
@@ -480,10 +656,14 @@ fn bottom_panel(state: &mut GuiState, ui: &mut egui::Ui) {
             if let Some(stats) = &series.stats {
                 ui.separator();
                 ui.label(format!(
-                    "frames {}  samples/channel {:.2}  min coverage {:.2}  filled {}",
+                    "{} {}  {} {:.2}  {} {:.2}  {} {}",
+                    lang.t("frames", "кадров"),
                     stats.frames,
+                    lang.t("samples/channel", "отсчётов/канал"),
                     stats.mean_samples_per_channel,
+                    lang.t("min coverage", "мин. покрытие"),
                     stats.min_coverage,
+                    lang.t("filled", "заполнено"),
                     stats.filled_pixels
                 ));
             }
@@ -491,9 +671,13 @@ fn bottom_panel(state: &mut GuiState, ui: &mut egui::Ui) {
     });
     if let Some(error) = state.error.clone() {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("error").color(Color32::RED).strong());
+            ui.label(
+                egui::RichText::new(lang.t("error", "ошибка"))
+                    .color(Color32::RED)
+                    .strong(),
+            );
             ui.label(error);
-            if ui.button("dismiss").clicked() {
+            if ui.button(lang.t("dismiss", "скрыть")).clicked() {
                 state.error = None;
             }
         });
@@ -501,9 +685,11 @@ fn bottom_panel(state: &mut GuiState, ui: &mut egui::Ui) {
     if let Some(series) = state.selected_series() {
         if let Some(result) = series.result {
             ui.label(format!(
-                "result {} x {}  scale {}  {:.2} MP  white {}",
+                "{} {} x {}  {} {}  {:.2} MP  white {}",
+                lang.t("result", "результат"),
                 result.width,
                 result.height,
+                lang.t("scale", "масштаб"),
                 result.scale,
                 result.megapixels(),
                 result.white
@@ -511,7 +697,8 @@ fn bottom_panel(state: &mut GuiState, ui: &mut egui::Ui) {
         }
         for (path, bytes) in &series.saved {
             ui.label(format!(
-                "saved {} ({})",
+                "{} {} ({})",
+                lang.t("saved", "сохранено"),
                 path.display(),
                 pipeline::fmt_bytes(*bytes)
             ));
@@ -529,11 +716,19 @@ fn bottom_panel(state: &mut GuiState, ui: &mut egui::Ui) {
     }
 }
 
-fn canvas(state: &mut GuiState, cache: &mut PreviewCache, ui: &mut egui::Ui) {
+fn canvas(state: &mut GuiState, cache: &mut PreviewCache, lang: Lang, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         let previous = state.view.source;
-        ui.selectable_value(&mut state.view.source, ViewSource::Merged, "Merged");
-        ui.selectable_value(&mut state.view.source, ViewSource::Reference, "Reference");
+        ui.selectable_value(
+            &mut state.view.source,
+            ViewSource::Merged,
+            source_label(lang, ViewSource::Merged),
+        );
+        ui.selectable_value(
+            &mut state.view.source,
+            ViewSource::Reference,
+            source_label(lang, ViewSource::Reference),
+        );
         if state.view.source != previous {
             state.view.fitted = true;
             state.view.zoom = 0.0;
@@ -542,8 +737,8 @@ fn canvas(state: &mut GuiState, cache: &mut PreviewCache, ui: &mut egui::Ui) {
                 rect: None,
             });
         }
-        ui.checkbox(&mut state.view.crop, "1:1 crop");
-        if ui.button("fit").clicked() {
+        ui.checkbox(&mut state.view.crop, lang.t("1:1 crop", "кроп 1:1"));
+        if ui.button(lang.t("fit", "вписать")).clicked() {
             state.view.fitted = true;
         }
         if ui.button("100%").clicked() {
@@ -562,7 +757,10 @@ fn canvas(state: &mut GuiState, cache: &mut PreviewCache, ui: &mut egui::Ui) {
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            "no merged image yet: open a folder and press Merge",
+            lang.t(
+                "no merged image yet: open a folder and press Merge",
+                "объединённого изображения ещё нет: откройте папку и нажмите «Объединить»",
+            ),
             egui::FontId::proportional(16.0),
             Color32::GRAY,
         );
@@ -628,7 +826,7 @@ fn canvas(state: &mut GuiState, cache: &mut PreviewCache, ui: &mut egui::Ui) {
         painter.text(
             rect.right_top() + Vec2::new(-8.0, 8.0),
             egui::Align2::RIGHT_TOP,
-            "loading detail",
+            lang.t("loading detail", "загрузка деталей"),
             egui::FontId::monospace(12.0),
             Color32::from_rgb(230, 200, 120),
         );
@@ -636,14 +834,18 @@ fn canvas(state: &mut GuiState, cache: &mut PreviewCache, ui: &mut egui::Ui) {
 
     let label = format!(
         "{}  {} x {}  {:.0}%{}  {}",
-        state.view.source.label(),
+        source_label(lang, state.view.source),
         dims.0,
         dims.1,
         zoom * 100.0,
-        if state.view.crop { "  crop" } else { "" },
+        if state.view.crop {
+            lang.t("  crop", "  кроп")
+        } else {
+            ""
+        },
         match level {
-            LodLevel::Base => "base",
-            LodLevel::Detail => "detail 1:1",
+            LodLevel::Base => lang.t("base", "база"),
+            LodLevel::Detail => lang.t("detail 1:1", "детали 1:1"),
         }
     );
     painter.text(
@@ -692,7 +894,9 @@ fn paint_slot(
 mod tests {
     use super::*;
     use crate::app::demo;
-    use crate::app::model::{EditOptions, FrameInfo, PreviewSlot, SeriesView, Stage, MAX_PREVIEW_DIM};
+    use crate::app::model::{
+        EditOptions, FrameInfo, PreviewSlot, SeriesView, Stage, MAX_PREVIEW_DIM,
+    };
     use crate::app::pipeline::ResultInfo;
 
     fn demo_state() -> GuiState {
@@ -726,12 +930,17 @@ mod tests {
 
     fn run_frame(state: &mut GuiState, cache: &mut PreviewCache) -> usize {
         let ctx = egui::Context::default();
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(1280.0, 800.0),
-        ));
-        let mut output = ctx.run_ui(input, |ui| draw(state, cache, ui));
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut prefs = UiPrefs::default();
+        let mut output = ctx.run_ui(input, |ui| {
+            let _ = draw(state, cache, &mut prefs, ui);
+        });
         output.textures_delta.clear();
         output.shapes.len()
     }

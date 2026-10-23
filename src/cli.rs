@@ -5,13 +5,19 @@
 //!                   [--format dng|tiff] [--compression none|deflate]
 //!                   [--also-1x] [--no-align] [--threads N] [--quiet]
 //!   pixelshift inspect <input...>
-//!   pixelshift gui [--selftest] [--demo] [input...]
+//!   pixelshift gui [--selftest] [--demo] [--lang auto|en|ru]
+//!                   [--theme auto|dark|light] [--font system|builtin]
+//!                   [--distort K1[,K2[,K3]]] [--shot PATH] [--shot-zoom Z]
+//!                   [--shot-crop X,Y,W,H] [--shot-source merged|reference]
+//!                   [--shot-save] [--shot-timeout SECS] [--shot-log] [input...]
 //!
 //! Progress goes to stderr, the summary to stdout; any error exits with code 1.
 
-use crate::app::model::{self, Compression, OutFormat, ScaleMode};
+use crate::app::i18n::Lang;
+use crate::app::model::{self, Compression, OutFormat, ScaleMode, ViewSource};
 use crate::app::pipeline::{self, SeriesInfo};
-use crate::app::GuiOptions;
+use crate::app::prefs::{FontMode, ThemeMode};
+use crate::app::{GuiOptions, PrefsOverrides};
 use crate::types::MergeParams;
 use crate::write::DngFlavor;
 use anyhow::{bail, Context, Result};
@@ -216,6 +222,76 @@ pub struct InspectArgs {
     pub distort: crate::distort::Distortion,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum LangArg {
+    /// Follow the system locale (ru-* -> Russian, otherwise English).
+    Auto,
+    En,
+    Ru,
+}
+
+impl LangArg {
+    pub fn lang(self) -> Lang {
+        match self {
+            LangArg::Auto => Lang::detect(),
+            LangArg::En => Lang::En,
+            LangArg::Ru => Lang::Ru,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ThemeArg {
+    /// Follow the system theme.
+    Auto,
+    Dark,
+    Light,
+}
+
+impl ThemeArg {
+    pub fn theme(self) -> ThemeMode {
+        match self {
+            ThemeArg::Auto => ThemeMode::System,
+            ThemeArg::Dark => ThemeMode::Dark,
+            ThemeArg::Light => ThemeMode::Light,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum FontArg {
+    /// The system UI font, with the built-in font as a fallback.
+    System,
+    /// Only the fonts bundled with egui.
+    Builtin,
+}
+
+impl FontArg {
+    pub fn font(self) -> FontMode {
+        match self {
+            FontArg::System => FontMode::System,
+            FontArg::Builtin => FontMode::Builtin,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ShotSourceArg {
+    /// The merged high resolution result.
+    Merged,
+    /// The first frame of the series, as decoded.
+    Reference,
+}
+
+impl ShotSourceArg {
+    pub fn source(self) -> ViewSource {
+        match self {
+            ShotSourceArg::Merged => ViewSource::Merged,
+            ShotSourceArg::Reference => ViewSource::Reference,
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 pub struct GuiArgs {
     /// Run the GUI state machine without opening a window and print a report.
@@ -224,9 +300,61 @@ pub struct GuiArgs {
     /// Open the window with fabricated data instead of real NEF files.
     #[arg(long)]
     pub demo: bool,
+    /// Interface language for this run; auto follows the system locale.
+    #[arg(long, value_enum)]
+    pub lang: Option<LangArg>,
+    /// Colour theme for this run; auto follows the system theme.
+    #[arg(long, value_enum)]
+    pub theme: Option<ThemeArg>,
+    /// UI font for this run; omitted keeps the stored choice.
+    #[arg(long, value_enum)]
+    pub font: Option<FontArg>,
+    /// Lens distortion for this run: K1[,K2[,K3]] of the Brown model, positive
+    /// k1 removes pincushion; never stored.
+    #[arg(long, value_name = "K1[,K2[,K3]]", allow_hyphen_values = true, value_parser = parse_distort)]
+    pub distort: Option<crate::distort::Distortion>,
+    /// Capture the window to a JPEG once the merge is done, then exit; for the
+    /// reproducible README screenshots.
+    #[arg(long, value_name = "PATH")]
+    pub shot: Option<PathBuf>,
+    /// Canvas zoom of --shot; omitted keeps the fit-to-window view.
+    #[arg(long, value_name = "FACTOR")]
+    pub shot_zoom: Option<f32>,
+    /// 1:1 crop of the merged image shown by --shot: X,Y,W,H in output pixels.
+    #[arg(long, value_name = "X,Y,W,H", value_parser = parse_shot_crop)]
+    pub shot_crop: Option<(usize, usize, usize, usize)>,
+    /// Preview --shot captures: the merged result or the reference frame.
+    #[arg(long, value_enum, default_value_t = ShotSourceArg::Merged)]
+    pub shot_source: ShotSourceArg,
+    /// Save the merged result to a temporary file before --shot captures the
+    /// window, so the log line about it is in the picture.
+    #[arg(long)]
+    pub shot_save: bool,
+    /// Seconds --shot waits for the merge and the frame.
+    #[arg(long, value_name = "SECS", default_value_t = 20.0)]
+    pub shot_timeout: f32,
+    /// Start --shot with the log panel expanded.
+    #[arg(long)]
+    pub shot_log: bool,
     /// Optional inputs to preload (directories or NEF files).
     #[arg(value_name = "INPUT")]
     pub inputs: Vec<PathBuf>,
+}
+
+impl GuiArgs {
+    /// Screenshot mode as the application sees it; None for a normal run.
+    pub fn shot(&self) -> Option<crate::app::ShotRequest> {
+        let path = self.shot.clone()?;
+        Some(crate::app::ShotRequest {
+            path,
+            zoom: self.shot_zoom,
+            crop: self.shot_crop,
+            source: self.shot_source.source(),
+            save: self.shot_save,
+            log: self.shot_log,
+            timeout: std::time::Duration::from_secs_f32(self.shot_timeout.max(0.1)),
+        })
+    }
 }
 
 pub fn run() -> Result<()> {
@@ -234,16 +362,46 @@ pub fn run() -> Result<()> {
     match cli.command {
         Command::Merge(args) => run_merge(args),
         Command::Inspect(args) => run_inspect(args),
-        Command::Gui(args) => crate::app::run_with(GuiOptions {
-            selftest: args.selftest,
-            demo: args.demo,
-            inputs: args.inputs,
-        }),
+        Command::Gui(args) => {
+            let shot = args.shot();
+            crate::app::run_with(GuiOptions {
+                selftest: args.selftest,
+                demo: args.demo,
+                inputs: args.inputs,
+                prefs: PrefsOverrides {
+                    lang: args.lang.map(LangArg::lang),
+                    theme: args.theme.map(ThemeArg::theme),
+                    font: args.font.map(FontArg::font),
+                },
+                distort: args.distort,
+                shot,
+            })
+        }
     }
 }
 
 fn parse_distort(text: &str) -> std::result::Result<crate::distort::Distortion, String> {
     crate::distort::Distortion::parse(text)
+}
+
+/// "X,Y,W,H" of a preview crop, in output pixels.
+fn parse_shot_crop(
+    text: &str,
+) -> std::result::Result<(usize, usize, usize, usize), String> {
+    let parts: Vec<&str> = text.split([',', ';']).map(str::trim).collect();
+    if parts.len() != 4 {
+        return Err(format!("{text}: expected X,Y,W,H"));
+    }
+    let mut values = [0usize; 4];
+    for (slot, part) in values.iter_mut().zip(&parts) {
+        *slot = part
+            .parse()
+            .map_err(|_| format!("{part} is not a pixel count"))?;
+    }
+    if values[2] == 0 || values[3] == 0 {
+        return Err(format!("{text}: the crop needs a width and a height"));
+    }
+    Ok((values[0], values[1], values[2], values[3]))
 }
 
 fn parse_deconvolve(text: &str) -> std::result::Result<f32, String> {
@@ -722,6 +880,55 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_the_screenshot_flags() {
+        let cli = Cli::try_parse_from([
+            "pixelshift",
+            "gui",
+            "--demo",
+            "--distort",
+            "-0.040",
+            "--shot",
+            "out.jpg",
+            "--shot-zoom",
+            "2.0",
+            "--shot-crop",
+            "80,52,480,320",
+            "--shot-source",
+            "reference",
+            "--shot-save",
+            "--shot-log",
+            "--shot-timeout",
+            "5",
+        ])
+        .expect("parse the shot flags");
+        match cli.command {
+            Command::Gui(args) => {
+                let shot = args.shot().expect("--shot builds a request");
+                assert_eq!(shot.path, PathBuf::from("out.jpg"));
+                assert_eq!(shot.zoom, Some(2.0));
+                assert_eq!(shot.crop, Some((80, 52, 480, 320)));
+                assert_eq!(shot.source, ViewSource::Reference);
+                assert!(shot.save && shot.log);
+                assert_eq!(shot.timeout, std::time::Duration::from_secs(5));
+                assert_eq!(args.distort.map(|d| d.k1), Some(-0.040));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+
+        let plain = Cli::try_parse_from(["pixelshift", "gui"]).expect("parse a plain gui");
+        match plain.command {
+            Command::Gui(args) => {
+                assert!(args.shot().is_none());
+                assert!(args.distort.is_none());
+            }
+            _ => panic!("wrong subcommand"),
+        }
+
+        assert!(Cli::try_parse_from(["pixelshift", "gui", "--shot", "x.jpg", "--shot-crop", "1,2,3"])
+            .is_err());
+    }
+
+    #[test]
     fn cli_parses_a_plain_merge() {
         let cli = Cli::try_parse_from(["pixelshift", "merge", "series"]).expect("parse");
         match cli.command {
@@ -731,6 +938,50 @@ mod tests {
                 assert_eq!(args.compression, CompressionArg::None);
                 assert!(!args.no_compress);
                 assert_eq!(args.options().compression, Compression::None);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_the_gui_appearance_flags() {
+        let cli = Cli::try_parse_from([
+            "pixelshift",
+            "gui",
+            "--demo",
+            "--lang",
+            "ru",
+            "--theme",
+            "light",
+            "--font",
+            "builtin",
+        ])
+        .expect("parse the gui flags");
+        match cli.command {
+            Command::Gui(args) => {
+                assert_eq!(args.lang.map(LangArg::lang), Some(Lang::Ru));
+                assert_eq!(args.theme.map(ThemeArg::theme), Some(ThemeMode::Light));
+                assert_eq!(args.font.map(FontArg::font), Some(FontMode::Builtin));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+
+        let cli = Cli::try_parse_from(["pixelshift", "gui"]).expect("parse a plain gui");
+        match cli.command {
+            Command::Gui(args) => {
+                assert_eq!(args.lang, None);
+                assert_eq!(args.theme, None);
+                assert_eq!(args.font, None);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+
+        let cli = Cli::try_parse_from(["pixelshift", "gui", "--lang", "auto", "--theme", "auto"])
+            .expect("parse the auto flags");
+        match cli.command {
+            Command::Gui(args) => {
+                assert_eq!(args.lang.map(LangArg::lang), Some(Lang::detect()));
+                assert_eq!(args.theme.map(ThemeArg::theme), Some(ThemeMode::System));
             }
             _ => panic!("wrong subcommand"),
         }

@@ -52,13 +52,116 @@ pub fn shifts(frames: &[RawFrame]) -> Vec<Shift> {
     table
 }
 
-/// Deterministic smooth colour scene; u and v are normalised image coordinates.
+// --------------------------------------------------------------- details -----
+
+/// Spacing of the background grid, in demo frame pixels.
+const GRID_STEP: f32 = 10.0;
+/// Spacing of the concentric rings of the resolution target.
+const RING_PERIOD: f32 = 6.5;
+/// Half width of the finest stroke. With the one pixel antialias ramp below it
+/// is a 1.7 px line: anything thinner would alias inside a single Bayer cell
+/// and turn the 1:1 preview into moire instead of detail.
+const STROKE: f32 = 0.35;
+/// Half width of a ring: 2.5 px, so the target still reads when the canvas
+/// magnifies the merged frame past 1:1.
+const RING_STROKE: f32 = 0.75;
+
+/// Coverage of a stroke of half width `half` at `distance` pixels from its
+/// centre, antialiased over the last pixel.
+fn stroke(distance: f32, half: f32) -> f32 {
+    (half + 0.5 - distance).clamp(0.0, 1.0)
+}
+
+/// Thin grid over the whole frame: straight lines, so a lens correction bends
+/// them visibly.
+fn grid(x: f32, y: f32) -> f32 {
+    let dx = (x - GRID_STEP * (x / GRID_STEP).round()).abs();
+    let dy = (y - GRID_STEP * (y / GRID_STEP).round()).abs();
+    stroke(dx, STROKE).max(stroke(dy, STROKE))
+}
+
+/// Concentric rings around the centre: the resolution target that still shows
+/// structure when the preview is magnified past 1:1.
+fn rings(x: f32, y: f32) -> f32 {
+    let (cx, cy) = (DEMO_WIDTH as f32 * 0.5, DEMO_HEIGHT as f32 * 0.47);
+    let radius = ((x - cx) * (x - cx) + (y - cy) * (y - cy)).sqrt();
+    if !(12.0..=118.0).contains(&radius) {
+        return 0.0;
+    }
+    let phase = radius - RING_PERIOD * (radius / RING_PERIOD).round();
+    let fade = ((118.0 - radius) / 16.0).clamp(0.0, 1.0) * ((radius - 12.0) / 8.0).clamp(0.0, 1.0);
+    stroke(phase.abs(), RING_STROKE) * fade
+}
+
+/// Axis aligned rectangle outline (x0, y0, x1, y1) with a stroke of half width
+/// `half`; the distance to the border is the distance to the unsigned box.
+fn outline(x: f32, y: f32, rect: [f32; 4], half: f32) -> f32 {
+    let (cx, cy) = ((rect[0] + rect[2]) * 0.5, (rect[1] + rect[3]) * 0.5);
+    let dx = (x - cx).abs() - (rect[2] - rect[0]) * 0.5;
+    let dy = (y - cy).abs() - (rect[3] - rect[1]) * 0.5;
+    let signed = if dx > 0.0 || dy > 0.0 {
+        (dx.max(0.0) * dx.max(0.0) + dy.max(0.0) * dy.max(0.0)).sqrt()
+    } else {
+        dx.max(dy)
+    };
+    stroke(signed.abs(), half)
+}
+
+/// Two dark and two bright frames: sharp 2 px borders in both directions of the
+/// tone curve.
+const DARK_FRAMES: [[f32; 4]; 2] = [[56.0, 44.0, 196.0, 148.0], [452.0, 44.0, 592.0, 148.0]];
+const LIGHT_FRAMES: [[f32; 4]; 2] = [[48.0, 268.0, 200.0, 372.0], [440.0, 268.0, 592.0, 372.0]];
+/// Bright border just inside the frame. A lens correction bends it away from
+/// the straight edge of the image itself, which is what makes the curvature
+/// readable in the distortion screenshot.
+const BORDER: [f32; 4] = [10.0, 10.0, 630.0, 414.0];
+
+/// Short strokes of the two rulers along the bottom and the left edge.
+fn ticks(x: f32, y: f32) -> f32 {
+    let step = 12.0;
+    let mut coverage: f32 = 0.0;
+    let dx = (x - step * ((x - 12.0) / step).round()).abs();
+    let dy = (y - 400.0).abs();
+    if dx < 2.0 && dy < 8.0 {
+        coverage = stroke(dx, STROKE) * (8.0 - dy).clamp(0.0, 1.0);
+    }
+    let dx = (y - step * ((y - 14.0) / step).round()).abs();
+    let dy = (x - 14.0).abs();
+    if dx < 2.0 && dy < 6.0 {
+        coverage = coverage.max(stroke(dx, STROKE) * (6.0 - dy).clamp(0.0, 1.0));
+    }
+    coverage
+}
+
+/// Deterministic demo scene: a low contrast colour gradient overlaid with a
+/// high frequency detail layer, so 1:1 previews and README screenshots show
+/// what the tool is for. u and v are normalised image coordinates.
 fn scene(u: f32, v: f32) -> [f32; 3] {
     let tau = std::f32::consts::TAU;
-    let r = 0.55 + 0.35 * (tau * (1.7 * u + 0.10)).sin() * (tau * (1.3 * v + 0.20)).cos();
-    let g = 0.50 + 0.30 * (tau * (2.3 * u + 0.30)).cos();
-    let b = 0.45 + 0.30 * (tau * (1.1 * u + 0.70)).sin() * (tau * (2.1 * v)).sin();
-    [r, g, b].map(|c| c.clamp(0.02, 0.98))
+    // Kept well below 0.5: the preview applies the camera white balance (blue
+    // is scaled by ~2), and a brighter background would clip the detail.
+    let r = 0.22 + 0.08 * (tau * (0.9 * u + 0.05)).sin();
+    let g = 0.27 + 0.07 * (tau * (1.1 * v + 0.35)).cos();
+    let b = 0.12 + 0.04 * (tau * (0.7 * u + 0.30)).sin();
+    let x = u * DEMO_WIDTH as f32;
+    let y = v * DEMO_HEIGHT as f32;
+
+    let dark = DARK_FRAMES
+        .iter()
+        .map(|rect| outline(x, y, *rect, 1.0))
+        .fold(0.0, f32::max);
+    let warm = outline(x, y, LIGHT_FRAMES[0], 1.0);
+    let cool = outline(x, y, LIGHT_FRAMES[1], 1.0);
+    let border = outline(x, y, BORDER, 0.7);
+    let ticks = ticks(x, y);
+    let ink = (0.55 * grid(x, y)).max(0.90 * rings(x, y)).max(0.92 * dark);
+    let dim = 1.0 - ink;
+    let glow = 0.36 * ticks + 0.40 * border;
+    [
+        (r * dim + 0.42 * warm + 0.14 * cool + glow).clamp(0.01, 0.95),
+        (g * dim + 0.34 * warm + 0.26 * cool + glow).clamp(0.01, 0.95),
+        (b * dim + 0.14 * warm + 0.40 * cool + glow).clamp(0.01, 0.95),
+    ]
 }
 
 fn cam_xyz() -> [[f32; 3]; 4] {

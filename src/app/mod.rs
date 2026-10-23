@@ -1,17 +1,31 @@
 //! egui/eframe GUI.
 
 pub mod demo;
+pub mod i18n;
 pub mod model;
 pub mod pipeline;
+pub mod prefs;
 pub mod selftest;
 pub mod ui;
 pub mod worker;
 
-use crate::app::model::{GuiState, Request, Stage};
+use crate::app::i18n::Lang;
+use crate::app::model::{GuiState, Request, Stage, ViewSource, MAX_ZOOM, MIN_ZOOM};
+use crate::app::prefs::{FontMode, ThemeMode, UiPrefs};
 use crate::app::worker::{Command, Event, Mode, SaveTarget, Worker};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use eframe::egui;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Per-run overrides of the stored preferences (pixelshift gui --lang ...).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PrefsOverrides {
+    pub lang: Option<Lang>,
+    pub theme: Option<ThemeMode>,
+    pub font: Option<FontMode>,
+}
 
 /// Options of the GUI entry point, filled in from pixelshift gui ... .
 #[derive(Clone, Debug, Default)]
@@ -19,6 +33,30 @@ pub struct GuiOptions {
     pub selftest: bool,
     pub demo: bool,
     pub inputs: Vec<PathBuf>,
+    pub prefs: PrefsOverrides,
+    /// Lens distortion applied to this run only (pixelshift gui --distort).
+    pub distort: Option<crate::distort::Distortion>,
+    /// Reproducible screenshot mode (pixelshift gui --shot).
+    pub shot: Option<ShotRequest>,
+}
+
+/// What the screenshot mode captures once the series is merged.
+#[derive(Clone, Debug)]
+pub struct ShotRequest {
+    /// JPEG file to write; the run exits with 0 afterwards.
+    pub path: PathBuf,
+    /// Canvas zoom; None keeps the fit-to-window view.
+    pub zoom: Option<f32>,
+    /// Region of the merged image to fetch and show as a 1:1 crop.
+    pub crop: Option<(usize, usize, usize, usize)>,
+    /// Preview the window shows.
+    pub source: ViewSource,
+    /// Write the merged result to a temporary file first, so the log shows it.
+    pub save: bool,
+    /// Start with the log panel expanded.
+    pub log: bool,
+    /// Deadline for the whole sequence.
+    pub timeout: Duration,
 }
 
 /// Start the GUI with default options (pixelshift without arguments).
@@ -39,10 +77,17 @@ pub fn run_with(options: GuiOptions) -> Result<()> {
         ..Default::default()
     };
     let inputs = options.inputs.clone();
+    let overrides = options.prefs;
+    let distort = options.distort;
+    let shot = options.shot.clone();
     eframe::run_native(
         "pixelshift",
         native,
-        Box::new(move |cc| Ok(Box::new(PixelShiftApp::new(cc, mode, inputs)))),
+        Box::new(move |cc| {
+            Ok(Box::new(PixelShiftApp::new(
+                cc, mode, inputs, overrides, distort, shot,
+            )))
+        }),
     )
     .map_err(|error| anyhow!("could not start the GUI: {error}"))
 }
@@ -52,11 +97,49 @@ struct PixelShiftApp {
     cache: ui::PreviewCache,
     worker: Worker,
     last_selected: usize,
+    prefs: UiPrefs,
+    saved_prefs: UiPrefs,
+    overrides: PrefsOverrides,
+    prefs_stored: bool,
+    /// Set in --shot mode: the capture state machine.
+    shot: Option<Shot>,
 }
 
 impl PixelShiftApp {
-    fn new(_cc: &eframe::CreationContext<'_>, mode: Mode, inputs: Vec<PathBuf>) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        mode: Mode,
+        inputs: Vec<PathBuf>,
+        overrides: PrefsOverrides,
+        distort: Option<crate::distort::Distortion>,
+        shot: Option<ShotRequest>,
+    ) -> Self {
         let mut state = GuiState::new(mode);
+        // --distort overrides the slider for this run: the worker receives it
+        // with the load command and nothing is written to the preferences.
+        if let Some(distort) = distort {
+            state.options.distort = distort;
+        }
+        if shot.as_ref().map(|shot| shot.log).unwrap_or(false) {
+            state.show_log = true;
+        }
+        let saved_prefs = load_prefs(cc.storage, &mut state);
+        let mut prefs = saved_prefs;
+        if let Some(lang) = overrides.lang {
+            prefs.lang = lang;
+        }
+        if let Some(theme) = overrides.theme {
+            prefs.theme = theme;
+        }
+        if let Some(font) = overrides.font {
+            prefs.font = font;
+        }
+        // Applied in the app creator, before the first egui pass: no light flash
+        // when the stored or requested theme is dark.
+        prefs.install(&cc.egui_ctx);
+        if let Some(warning) = prefs::take_font_warning() {
+            state.push_log(warning);
+        }
         let worker = Worker::spawn(mode);
         match mode {
             Mode::Demo => worker.send(Command::Scan(Vec::new())),
@@ -72,7 +155,39 @@ impl PixelShiftApp {
             cache: ui::PreviewCache::default(),
             worker,
             last_selected: 0,
+            prefs,
+            saved_prefs,
+            overrides,
+            prefs_stored: false,
+            shot: shot.map(Shot::new),
         }
+    }
+
+    /// Preferences as they should be written back: a value that only came from
+    /// a command line flag is replaced by the stored one, so flags never stick.
+    fn persisted_prefs(&self) -> UiPrefs {
+        let mut prefs = self.prefs;
+        if let Some(lang) = self.overrides.lang {
+            if prefs.lang == lang {
+                prefs.lang = self.saved_prefs.lang;
+            }
+        }
+        if let Some(theme) = self.overrides.theme {
+            if prefs.theme == theme {
+                prefs.theme = self.saved_prefs.theme;
+            }
+        }
+        if let Some(font) = self.overrides.font {
+            if prefs.font == font {
+                prefs.font = self.saved_prefs.font;
+            }
+        }
+        prefs
+    }
+
+    fn store_prefs(&self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, prefs::STORAGE_KEY, &self.persisted_prefs());
+        storage.flush();
     }
 
     fn poll_worker(&mut self) -> bool {
@@ -188,7 +303,9 @@ impl PixelShiftApp {
             dialog = dialog.set_directory(dir);
         }
         if let Some(path) = dialog.save_file() {
-            self.state.requests.push(Request::SaveAs { path, downsample });
+            self.state
+                .requests
+                .push(Request::SaveAs { path, downsample });
         }
     }
 
@@ -266,19 +383,360 @@ impl PixelShiftApp {
 }
 
 impl eframe::App for PixelShiftApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let finished = self.poll_worker();
         if self.state.selected != self.last_selected {
             self.last_selected = self.state.selected;
             self.refresh_free_space();
         }
-        ui::draw(&mut self.state, &mut self.cache, ui);
+        let mut save_needed = !self.prefs_stored;
+        if ui::draw(&mut self.state, &mut self.cache, &mut self.prefs, ui) {
+            self.prefs.install(ui.ctx());
+            if let Some(warning) = prefs::take_font_warning() {
+                self.state.push_log(warning);
+            }
+            save_needed = true;
+        }
+        if save_needed {
+            if let Some(storage) = frame.storage_mut() {
+                self.store_prefs(storage);
+                self.prefs_stored = true;
+            }
+        }
         self.handle_requests(ui.ctx());
+        if let Some(shot) = self.shot.as_mut() {
+            shot.step(&mut self.state, ui.ctx());
+        }
         if finished && self.state.batch_running {
             self.advance_batch();
         }
         if self.state.needs_tick() {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(80));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(80));
         }
     }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, prefs::STORAGE_KEY, &self.persisted_prefs());
+    }
+}
+
+/// Load the stored preferences; a damaged entry is reported, never fatal.
+fn load_prefs(storage: Option<&dyn eframe::Storage>, state: &mut GuiState) -> UiPrefs {
+    let Some(storage) = storage else {
+        return UiPrefs::default();
+    };
+    match eframe::get_value::<UiPrefs>(storage, prefs::STORAGE_KEY) {
+        Some(prefs) => prefs,
+        None => {
+            if storage.get_string(prefs::STORAGE_KEY).is_some() {
+                state.push_log(
+                    "stored ui_prefs could not be decoded; using the defaults".to_string(),
+                );
+            }
+            UiPrefs::default()
+        }
+    }
+}
+// ---------------------------------------------------------------- shot ------
+
+/// Phases of the screenshot mode; each one waits for the application to reach a
+/// state the previous step asked for, so nothing depends on a fixed delay.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShotPhase {
+    /// Waiting for the merge to finish and the base preview to arrive.
+    Merging,
+    /// Waiting for the requested view, crop and save to settle.
+    Settling,
+    /// Waiting for the compositor to hand back the captured frame.
+    Capturing,
+}
+
+impl ShotPhase {
+    fn label(self) -> &'static str {
+        match self {
+            ShotPhase::Merging => "waiting for the merge",
+            ShotPhase::Settling => "waiting for the view to settle",
+            ShotPhase::Capturing => "waiting for the screenshot",
+        }
+    }
+}
+
+/// Drives the screenshot mode from the frame callback: the same state machine
+/// the window uses, plus a view request, an optional save and the framebuffer
+/// grab.
+struct Shot {
+    request: ShotRequest,
+    started: Instant,
+    phase: ShotPhase,
+    /// Consecutive frames the canvas has been idle: two mean it settled.
+    settled: u32,
+    configured: Instant,
+    /// Crop window handed to the worker; the shot waits until it is cached.
+    crop: Option<(usize, usize, usize, usize)>,
+    reference_requested: bool,
+    save_pending: bool,
+    capture: Arc<Mutex<Option<Arc<egui::ColorImage>>>>,
+    capture_requested: bool,
+}
+
+/// The canvas debounces crop requests; the shot has to outlast that debounce
+/// before it may call the view settled.
+const SETTLE_DELAY: Duration = Duration::from_millis(400);
+/// Repaint cadence while a shot waits for the worker or the framebuffer.
+const SHOT_TICK: Duration = Duration::from_millis(40);
+
+impl Shot {
+    fn new(request: ShotRequest) -> Self {
+        Self {
+            request,
+            started: Instant::now(),
+            phase: ShotPhase::Merging,
+            settled: 0,
+            configured: Instant::now(),
+            crop: None,
+            reference_requested: false,
+            save_pending: false,
+            capture: Arc::new(Mutex::new(None)),
+            capture_requested: false,
+        }
+    }
+
+    /// One step per frame, after the widgets ran and the worker commands were
+    /// dispatched, so a view change here is painted by the next frame.
+    fn step(&mut self, state: &mut GuiState, ctx: &egui::Context) {
+        if self.started.elapsed() > self.request.timeout {
+            eprintln!(
+                "pixelshift: --shot timed out after {:.1} s ({}): no JPEG was written to {}",
+                self.request.timeout.as_secs_f64(),
+                self.phase.label(),
+                self.request.path.display()
+            );
+            std::process::exit(1);
+        }
+        // Keep painting even when the window ends up behind another one: without
+        // this the merge would stall (eframe runs no pass for an occluded
+        // window) and the shot would only hit the timeout.
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+        match self.phase {
+            ShotPhase::Merging => self.wait_merged(state),
+            ShotPhase::Settling => self.wait_settled(state, ctx),
+            ShotPhase::Capturing => self.wait_frame(ctx),
+        }
+    }
+
+    fn wait_merged(&mut self, state: &mut GuiState) {
+        if let Some(error) = &state.error {
+            // A failed load cannot produce the picture; report it instead of
+            // waiting for the timeout.
+            eprintln!(
+                "pixelshift: --shot stopped, the merge failed: {error} (no JPEG was written)"
+            );
+            std::process::exit(1);
+        }
+        let merged = state
+            .selected_series()
+            .and_then(|series| series.result)
+            .is_some();
+        if !merged || state.stage != Stage::Done {
+            return;
+        }
+        if self.request.source == ViewSource::Reference && !self.reference_requested {
+            self.reference_requested = true;
+            state.requests.push(Request::View {
+                source: ViewSource::Reference,
+                rect: None,
+            });
+        }
+        let ready = state.previews[self.request.source.index()]
+            .as_ref()
+            .map(|slot| slot.image.width > 0 && slot.image.height > 0)
+            .unwrap_or(false);
+        if !ready {
+            return;
+        }
+        self.configure(state);
+        self.phase = ShotPhase::Settling;
+    }
+
+    /// Leave the fit-to-window view and ask for the crop and the save the shot
+    /// asked for; the widget code picks the new view up on the next frame.
+    fn configure(&mut self, state: &mut GuiState) {
+        let dims = state.image_size().unwrap_or((0, 0));
+        state.view.source = self.request.source;
+        state.view.fitted = false;
+        state.view.crop = self.request.crop.is_some();
+        match self.request.crop {
+            Some((x, y, w, h)) => {
+                let zoom = self.request.zoom.unwrap_or(1.0);
+                state.view.zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+                state.view.center = [x as f32 + w as f32 * 0.5, y as f32 + h as f32 * 0.5];
+                self.crop = Some((x, y, w, h));
+                state.requests.push(Request::View {
+                    source: self.request.source,
+                    rect: Some((x, y, w, h)),
+                });
+            }
+            None => match self.request.zoom {
+                Some(zoom) => {
+                    state.view.zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+                    state.view.center = [dims.0 as f32 * 0.5, dims.1 as f32 * 0.5];
+                }
+                None => state.fit_view(),
+            },
+        }
+        if self.request.save {
+            let path = std::env::temp_dir().join(format!(
+                "pixelshift-shot-{}.{}",
+                std::process::id(),
+                state.options.format.ext()
+            ));
+            state.requests.push(Request::SaveAs {
+                path,
+                downsample: false,
+            });
+            self.save_pending = true;
+        }
+        self.configured = Instant::now();
+        self.settled = 0;
+    }
+
+    fn wait_settled(&mut self, state: &mut GuiState, ctx: &egui::Context) {
+        let crop_ok = match self.crop {
+            Some(rect) => state.crop_for(Some(rect)).is_some(),
+            None => true,
+        };
+        let save_ok = !self.save_pending
+            || state
+                .selected_series()
+                .map(|series| !series.saved.is_empty())
+                .unwrap_or(false);
+        let idle = !state.is_busy() && !state.crop_pending;
+        let warm = self.configured.elapsed() >= SETTLE_DELAY;
+        if crop_ok && save_ok && idle && warm {
+            self.settled += 1;
+        } else {
+            self.settled = 0;
+        }
+        if self.settled >= 2 {
+            self.phase = ShotPhase::Capturing;
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(SHOT_TICK);
+        }
+    }
+
+    fn wait_frame(&mut self, ctx: &egui::Context) {
+        if let Some(image) = self.captured() {
+            match self.write(&image, ctx) {
+                Ok(line) => {
+                    println!("{line}");
+                    std::process::exit(0);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "pixelshift: --shot could not write {}: {error:#}",
+                        self.request.path.display()
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        if !self.capture_requested {
+            let slot = Arc::clone(&self.capture);
+            let repaint = ctx.clone();
+            ctx.request_screenshot(move |image| {
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Some(image);
+                }
+                repaint.request_repaint();
+            });
+            self.capture_requested = true;
+        }
+        ctx.request_repaint_after(SHOT_TICK);
+    }
+
+    fn captured(&self) -> Option<Arc<egui::ColorImage>> {
+        self.capture.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    fn write(&self, image: &egui::ColorImage, ctx: &egui::Context) -> Result<String> {
+        let (width, height, rgb) = shrink(image, ctx.pixels_per_point());
+        if width == 0 || height == 0 {
+            return Err(anyhow!("the captured frame is empty"));
+        }
+        let bytes = crate::write::jpeg::encode_rgb(&rgb, width, height);
+        if let Some(dir) = self.request.path.parent() {
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("creating {}", dir.display()))?;
+            }
+        }
+        std::fs::write(&self.request.path, &bytes)
+            .with_context(|| format!("writing {}", self.request.path.display()))?;
+        Ok(format!(
+            "shot: {} ({} x {} px, {})",
+            self.request.path.display(),
+            width,
+            height,
+            pipeline::fmt_bytes(bytes.len() as u64)
+        ))
+    }
+}
+
+/// Physical screenshot pixels to logical pixels: the framebuffer has
+/// pixels_per_point times as many pixels as the window has points, so the frame
+/// is box filtered back to the size the window reports. Each output pixel
+/// averages exactly its share of the source, which keeps Retina (2.0) and
+/// fractional scale factors alike.
+fn shrink(image: &egui::ColorImage, pixels_per_point: f32) -> (usize, usize, Vec<u8>) {
+    let (width, height) = (image.size[0], image.size[1]);
+    if width == 0 || height == 0 {
+        return (0, 0, Vec::new());
+    }
+    let ppp = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
+    let out_w = ((width as f32 / ppp).round() as usize).clamp(1, width);
+    let out_h = ((height as f32 / ppp).round() as usize).clamp(1, height);
+    let step_x = width as f32 / out_w as f32;
+    let step_y = height as f32 / out_h as f32;
+    let mut rgb = vec![0u8; out_w * out_h * 3];
+    for oy in 0..out_h {
+        let y0 = oy as f32 * step_y;
+        let y1 = y0 + step_y;
+        for ox in 0..out_w {
+            let x0 = ox as f32 * step_x;
+            let x1 = x0 + step_x;
+            let mut sum = [0.0f32; 3];
+            let mut weight = 0.0f32;
+            let mut y = y0.floor().max(0.0) as usize;
+            while (y as f32) < y1 && y < height {
+                let wy = ((y as f32 + 1.0).min(y1) - (y as f32).max(y0)).max(0.0);
+                let mut x = x0.floor().max(0.0) as usize;
+                while wy > 0.0 && (x as f32) < x1 && x < width {
+                    let wx = ((x as f32 + 1.0).min(x1) - (x as f32).max(x0)).max(0.0);
+                    if wx > 0.0 {
+                        let color = image.pixels[y * width + x];
+                        let tap = wx * wy;
+                        sum[0] += f32::from(color.r()) * tap;
+                        sum[1] += f32::from(color.g()) * tap;
+                        sum[2] += f32::from(color.b()) * tap;
+                        weight += tap;
+                    }
+                    x += 1;
+                }
+                y += 1;
+            }
+            let index = (oy * out_w + ox) * 3;
+            if weight > 0.0 {
+                for channel in 0..3 {
+                    rgb[index + channel] = (sum[channel] / weight).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+    (out_w, out_h, rgb)
 }
