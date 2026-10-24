@@ -1362,6 +1362,247 @@ fn motion_mask_removes_ghosts_of_a_moving_object() {
 }
 
 #[test]
+fn stabilization_crops_to_the_frames_overlap() {
+    // A hand-held-like series: every frame displaced by whole pixels in a
+    // different direction. The plain merge ghosts at the borders (frames
+    // disagree about what the border pixels see); the stabilized merge crops
+    // to the common overlap and reconstructs the interior cleanly.
+    let (w, h) = (256usize, 192usize);
+    let positions: Vec<(f64, f64)> = (0..8)
+        .map(|i| {
+            let a = i as f64 * 0.7;
+            ((6.0 + 4.0 * a.cos()) , (-4.0 + 4.0 * a.sin()))
+        })
+        .collect();
+    let shifts: Vec<Shift> = positions.iter().map(|p| Shift::new(p.0, p.1)).collect();
+    let frames: Vec<RawFrame> = positions
+        .iter()
+        .enumerate()
+        .map(|(i, p)| render(&Scene, w, h, *p, 3.0, 900 + i as u64))
+        .collect();
+
+    let shifts2 = shifts.clone();
+    let plain = merge::merge(&frames, &params(1, shifts.clone())).expect("plain merge");
+    let mut p = params(1, shifts2);
+    p.stabilize = true;
+    let stab = merge::merge(&frames, &p).expect("stabilized merge");
+
+    // The crop keeps the common overlap: the shifts span roughly +/-10 px,
+    // so about that much must go from each edge.
+    assert!(stab.width < plain.width, "stabilization did not crop");
+    assert!(stab.width >= plain.width - 30 && stab.width > 200, "over-cropped: {}", stab.width);
+    assert!(stab.height < plain.height && stab.height > 150, "height crop: {}", stab.height);
+
+    // Inside the cropped area the stabilized merge must be at least as good
+    // as the plain one: the scene is static, so a correct alignment plus
+    // crop only removes the broken border. The cropped origin (x0, y0) comes
+    // from the same rectangle computation the merge used.
+    let used: Vec<usize> = (0..frames.len()).collect();
+    let (cx0, cy0, _, _) = merge::stabilized_rect_pub(&shifts, &used, w, h);
+    let inset = 8;
+    let sse = |m: &MergeResult, ox: usize, oy: usize| {
+        let k = m.scale as usize;
+        let mut acc = 0.0f64;
+        let mut n = 0.0f64;
+        for y in inset..m.height.saturating_sub(inset) {
+            for x in inset..m.width.saturating_sub(inset) {
+                let truth = Scene.rgb((x + ox) as f64 / k as f64, (y + oy) as f64 / k as f64);
+                for c in 0..3 {
+                    let got = m.planes[c][y * m.width + x] as f64;
+                    let want = truth[c] * span();
+                    acc += (got - want) * (got - want);
+                    n += 1.0;
+                }
+            }
+        }
+        (acc / n).sqrt()
+    };
+    let rms_plain = sse(&plain, 0, 0);
+    let rms_stab = sse(&stab, cx0, cy0);
+    println!(
+        "interior rms: plain {rms_plain:.2}, stabilized {rms_stab:.2} ({}x{} -> {}x{})",
+        plain.width, plain.height, stab.width, stab.height
+    );
+    assert!(
+        rms_stab <= rms_plain * 1.05 + 1.0,
+        "stabilization hurt the interior: {rms_plain:.2} -> {rms_stab:.2}"
+    );
+}
+
+/// Slow square: 3 px over 8 frames, invisible frame-to-frame at block scale.
+fn slow_scene_rgb(x: f64, y: f64, t: f64) -> [f64; 3] {
+    let mut rgb = Scene.rgb(x, y);
+    let (ox, oy) = (50.0 + 3.0 * t, 46.0 + 2.0 * t);
+    let (dx, dy) = ((x - ox).abs(), (y - oy).abs());
+    if dx < 16.0 && dy < 16.0 {
+        for c in 0..3 {
+            rgb[c] = (rgb[c] * 0.15 + 0.95 * 0.85).clamp(0.02, 0.97);
+        }
+    }
+    rgb
+}
+
+#[test]
+fn deconvolution_shuts_down_inside_masked_zones() {
+    // Moving object + masks: the fallback band carries single-frame Bayer
+    // content that must NOT be sharpened (the demosaic pattern would only
+    // get louder), while the static area keeps the full deconvolution.
+    let (w, h) = (512usize, 384usize);
+    let positions = half_lattice();
+    let shifts: Vec<Shift> = positions.iter().map(|p| Shift::new(p.0, p.1)).collect();
+    let n = positions.len();
+    let frames: Vec<RawFrame> = positions
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let t = i as f64 / (n - 1) as f64;
+            render_moving(w, h, *p, t, 4.0, 1200 + i as u64)
+        })
+        .collect();
+    let motion = MotionParams {
+        enabled: true,
+        sensitivity: 1.0,
+    };
+    let masks = motion::masks(&frames, &shifts, &motion);
+
+    let mut sharp = params(1, shifts.clone());
+    sharp.deconvolve = 1.0;
+    sharp.motion = motion;
+    sharp.masks = masks.clone();
+    let sharp = merge::merge(&frames, &sharp).expect("sharpened masked merge");
+
+    let mut soft = params(1, shifts.clone());
+    soft.deconvolve = 0.0;
+    soft.motion = motion;
+    soft.masks = masks;
+    let soft = merge::merge(&frames, &soft).expect("soft masked merge");
+
+    let band = |x0: usize, y0: usize, x1: usize, y1: usize| -> f64 {
+        let mut acc = 0.0;
+        let mut cnt = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                for c in 0..3 {
+                    let d = (sharp.planes[c][y * sharp.width + x] as i64
+                        - soft.planes[c][y * soft.width + x] as i64)
+                        .abs();
+                    acc += d as f64;
+                    cnt += 1;
+                }
+            }
+        }
+        acc / cnt.max(1) as f64
+    };
+    // The square sweeps (50..96, 46..76) plus its rim: the fallback band.
+    let moving = band(30, 26, 118, 96);
+    let statik = band(300, 150, 505, 375);
+    println!(
+        "deconv delta: moving band {moving:.2} ADU, static area {statik:.2} ADU"
+    );
+    assert!(
+        moving < statik * 0.25,
+        "the gate must close deconvolution in the fallback band: {moving:.2} vs {statik:.2}"
+    );
+    assert!(statik > 0.5, "deconvolution must stay active in the static area");
+}
+
+#[test]
+fn slow_motion_is_caught_by_temporal_pairs() {
+    let (w, h) = (512usize, 384usize);
+    let positions = half_lattice();
+    let n = positions.len();
+    let shifts: Vec<Shift> = positions.iter().map(|p| Shift::new(p.0, p.1)).collect();
+    let cfa = Cfa::from_pattern_str("RGGB").expect("RGGB");
+    let frames: Vec<RawFrame> = positions
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let t = i as f64 / (n - 1) as f64;
+            let mut rng = Rng::new(1000 + i as u64);
+            let mut data = vec![0u16; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let c = cfa.0[y & 1][x & 1];
+                    let v = slow_scene_rgb(x as f64 + p.0, y as f64 + p.1, t)[c.idx()] * span()
+                        + BLACK as f64
+                        + 4.0 * rng.normal();
+                    data[y * w + x] = v.round().clamp(0.0, WHITE as f64) as u16;
+                }
+            }
+            RawFrame {
+                path: PathBuf::from("synthetic"),
+                width: w,
+                height: h,
+                data,
+                cfa,
+                black: BLACK,
+                cblack: [0; 4],
+                white: WHITE,
+                wb: [1.0, 1.0, 1.0, 1.0],
+                cam_xyz: [[0.0; 3]; 4],
+                rgb_cam: [[0.0; 3]; 4],
+                iso: 100.0,
+                shutter: 1.0 / 125.0,
+                aperture: 5.6,
+                focal: 50.0,
+                lens_make: String::new(),
+                lens_model: String::new(),
+                focal_35mm: 50,
+                max_aperture: 1.8,
+                lens_min_focal: 0.0,
+                lens_max_focal: 0.0,
+                lens_min_fnum: 0.0,
+                lens_max_fnum: 0.0,
+                lens_serial: String::new(),
+                body_serial: String::new(),
+                make: String::new(),
+                model: String::new(),
+                timestamp: String::new(),
+                index: 0,
+            }
+        })
+        .collect();
+
+    let motion = MotionParams {
+        enabled: true,
+        sensitivity: 1.0,
+    };
+    let masks = motion::masks(&frames, &shifts, &motion);
+    let masked_frames = masks.iter().filter(|m| m.is_some()).count();
+    println!("slow square: {masked_frames}/{} frames masked", n - 1);
+    assert!(
+        masked_frames >= n / 2,
+        "the temporal pairs must catch the slow object"
+    );
+
+    // And the masked merge must beat the plain one inside the sweep band.
+    let plain = merge::merge(&frames, &params(1, shifts.clone())).expect("plain");
+    let mut p = params(1, shifts);
+    p.motion = motion;
+    p.masks = masks;
+    let masked = merge::merge(&frames, &p).expect("masked");
+    let band = |m: &MergeResult| {
+        let mut acc = 0.0;
+        let mut cnt = 0.0;
+        for y in 20..90 {
+            for x in 30..80 {
+                let truth = slow_scene_rgb(x as f64, y as f64, 0.0);
+                for c in 0..3 {
+                    let got = m.planes[c][y * m.width + x] as f64;
+                    acc += (got - truth[c] * span()).powi(2);
+                    cnt += 1.0;
+                }
+            }
+        }
+        (acc / cnt).sqrt()
+    };
+    let bp = band(&plain);
+    let bm = band(&masked);
+    println!("slow sweep band rms: plain {bp:.1}, masked {bm:.1}");
+    assert!(bm < bp, "masked merge must win in the slow-motion band: {bp:.1} vs {bm:.1}");
+}
+
+#[test]
 fn motion_masks_on_a_static_series_are_empty() {
     let (w, h) = (256usize, 192usize);
     let positions = half_lattice();

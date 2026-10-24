@@ -65,6 +65,42 @@ keep the sensor grid and gain full colour resolution per pixel instead.
   per-colour interpolation is only needed to fill pixels whose coverage is
   incomplete (real, imperfect shifts, image borders).
 
+## Large-displacement alignment and stabilization
+
+`shift::measure` finds the global translation on a Gaussian pyramid level of the
+whole-frame lattice (factor 8 on a 6048 px frame, adaptive down to 2 on small
+frames, search +/-16 coarse px = +/-256 sensor px). Quasi-periodic scenes put
+several coarse NCC peaks within hundredths of each other, so the strongest five
+candidates are each refined by Gauss-Newton on the reference windows and ranked
+by the texture-weighted correlation of ALL windows at the refined offset - a
+single window is multi-modal on repetitive content. `fit_rigid` then takes a
+RANSAC consensus: every window pair defines an exact rigid hypothesis, inliers
+are windows within 1 px, and the consensus with the largest texture-weighted
+correlation wins (windows sitting on a moving object track the OBJECT and are
+outvoted). MAX_ROT is 1.2e-2 rad: hand-held shake rotates by 400..700 arcsec
+per frame and rejecting that rotation used to leave a multi-pixel residual.
+
+Measured on 109NZ6_3: the hand-held series previously failed alignment
+(residual 3..14.6 px, confidence 0); now residual 0.2..0.6 px with rotations
+accepted. The residual is rolling-shutter shear during rotation - genuinely
+non-rigid.
+
+`--stabilize` / EditOptions::stabilize crops the output to the intersection of
+the axis-aligned boxes of the mapped frame rectangles (merge::stabilized_rect,
+conservative against rotation).
+
+The motion detector's local floor now includes a misregistration term
+(max over the block of |gradient| * 2 * frame residual)^2: a busy static block
+disagrees by about gradient-times-residual under residual shake, which the pure
+noise median would flag as motion. With that term the hand-held static series
+mask 13..36 % -> 0..7 %.
+
+Slow motion is caught by temporal pairs: each frame is additionally differenced
+against the frames n/4 and n-1 captures away through the composed lattice
+affine, taking the per-block maximum of the energies. An object at 0.4 px/frame
+is invisible in the reference difference but crosses a block over the pair
+distance.
+
 ## Motion compensation (src/motion.rs)
 
 Opt-in (`MergeParams::motion`, CLI `--motion [--motion-sensitivity F]`, GUI
@@ -95,6 +131,15 @@ Measured on the 109NZ6_3 experiment set (9 x 32 frames, Z6 III):
 The saturation guard treats blocks whose luma is within 2 % of the block-sum
 maximum as no data: clipped blocks disagree nonlinearly and dwarf any
 threshold.
+
+Deconvolution is gated by the mask: each sensor block carries the share of
+used frames the mask removed there, and the reconstruction-kernel correction
+is scaled by (1 - share) at that block (merge::DeconvGate, wired into
+deconvolve_plane with the crop origin). A fully masked block falls back to
+the reference frame alone, and sharpening single-frame Bayer content only
+amplifies the demosaic pattern and chromatic fringes - measured on the
+synthetic moving-object scene: |deconv1 - deconv0| in the fallback band 0.00
+ADU (gate closed) vs 3.60 ADU in the static area (gate open).
 
 ## Output format decisions (current)
 

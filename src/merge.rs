@@ -217,12 +217,21 @@ pub fn merge(frames: &[RawFrame], params: &MergeParams) -> Result<MergeResult> {
         *mc = cov[c].iter().copied().max().unwrap_or(0);
     }
 
-    // Optional crop of the outermost incompletely covered pixels. Only lines
-    // that no remaining column or row can repair are dropped: a line is trimmed
-    // when every pixel on it is uncovered in some channel, which is exactly the
-    // unreachable rim of the shift lattice (for instance the first row of a half
-    // pixel lattice never receives green or blue).
+    // Output crop. Two sources trim the rectangle: electronic stabilization
+    // (the sensor-pixel overlap of every frame, scaled to the output grid) and
+    // the coverage trim, which drops lines that no column or row can repair -
+    // a line is removed when every pixel on it is uncovered in some channel,
+    // which is exactly the unreachable rim of the shift lattice (for instance
+    // the first row of a half pixel lattice never receives green or blue).
+    // The planes are cropped once, after both.
     let (mut x0, mut y0, mut x1, mut y1) = (0usize, 0usize, ow, oh);
+    if params.stabilize {
+        let (kx0, ky0, kx1, ky1) = stabilized_rect(&shifts, &used, sw, sh);
+        x0 = x0.max(kx0 * k);
+        y0 = y0.max(ky0 * k);
+        x1 = x1.min(kx1 * k);
+        y1 = y1.min(ky1 * k);
+    }
     if params.crop_uncovered {
         let complete = |i: usize| -> bool {
             (0..CHANNELS).all(|c| cov[c][i] as f32 >= 0.5 * max_cov[c] as f32)
@@ -249,14 +258,14 @@ pub fn merge(frames: &[RawFrame], params: &MergeParams) -> Result<MergeResult> {
                 break;
             }
         }
-        if (x0, y0, x1, y1) != (0, 0, ow, oh) {
-            for c in 0..CHANNELS {
-                planes[c] = crop_plane(&planes[c], ow, x0, y0, x1 - x0, y1 - y0);
-                cov[c] = crop_bytes(&cov[c], ow, x0, y0, x1 - x0, y1 - y0);
-            }
-            for (c, mc) in max_cov.iter_mut().enumerate() {
-                *mc = cov[c].iter().copied().max().unwrap_or(0);
-            }
+    }
+    if (x0, y0, x1, y1) != (0, 0, ow, oh) {
+        for c in 0..CHANNELS {
+            planes[c] = crop_plane(&planes[c], ow, x0, y0, x1 - x0, y1 - y0);
+            cov[c] = crop_bytes(&cov[c], ow, x0, y0, x1 - x0, y1 - y0);
+        }
+        for (c, mc) in max_cov.iter_mut().enumerate() {
+            *mc = cov[c].iter().copied().max().unwrap_or(0);
         }
     }
     let (nw, nh) = (x1 - x0, y1 - y0);
@@ -324,7 +333,23 @@ pub fn merge(frames: &[RawFrame], params: &MergeParams) -> Result<MergeResult> {
         );
     }
     if coeff > 0.0 {
-        deconvolve_planes(&mut planes, nw, nh, coeff as f32, span_f);
+        let gate = deconv_gate(params, &used);
+        if let (Some(g), true) = (&gate, std::env::var_os("PIXELSHIFT_DEBUG_DECONV").is_some()) {
+            let mean = g.frac.iter().sum::<f32>() / g.frac.len().max(1) as f32;
+            let worst = g.frac.iter().cloned().fold(0.0f32, f32::max);
+            eprintln!(
+                "deconv gate: mean {:.3}, worst block {:.3}",
+                mean, worst
+            );
+        }
+        deconvolve_planes(
+            &mut planes,
+            nw,
+            nh,
+            coeff as f32,
+            span_f,
+            gate.as_ref().map(|g| (g, x0, y0, k)),
+        );
     }
 
     let pixels = (nw * nh).max(1) as f64;
@@ -581,6 +606,51 @@ fn splat_deficit(shifts: &[Shift], used: &[usize], k: f64) -> f64 {
 /// amount > 1 additionally inverts the sensor aperture (the pixel integration,
 /// response sinc(w * scale / 2)), which the reconstruction cannot recover but
 /// which is the remaining part of the softness measured against NX Studio.
+/// Per sensor-block share of frames the motion mask removed: 0 = the merge
+/// used everything (deconvolution fully applies), 1 = the block fell back to
+/// the reference frame alone (single-frame Bayer content must not be
+/// sharpened - the demosaic pattern and chromatic fringes would only get
+/// louder).
+struct DeconvGate {
+    step: usize,
+    cols: usize,
+    rows: usize,
+    frac: Vec<f32>,
+}
+
+fn deconv_gate(params: &MergeParams, used: &[usize]) -> Option<DeconvGate> {
+    if params.masks.is_empty() {
+        return None;
+    }
+    let contributors: Vec<usize> = used.iter().copied().filter(|&i| i != 0).collect();
+    let first = contributors.first()?;
+    let template = params.masks.get(*first).and_then(|m| m.as_ref())?;
+    let (cols, rows, step) = (template.cols, template.rows, template.step);
+    if cols == 0 || rows == 0 || step == 0 {
+        return None;
+    }
+    let mut frac = vec![0.0f32; cols * rows];
+    for &i in &contributors {
+        if let Some(mask) = params.masks.get(i).and_then(|m| m.as_ref()) {
+            if mask.cols == cols && mask.rows == rows {
+                for (f, &b) in frac.iter_mut().zip(mask.blocked.iter()) {
+                    *f += if b != 0 { 1.0 } else { 0.0 };
+                }
+            }
+        }
+    }
+    let n = contributors.len() as f32;
+    for f in frac.iter_mut() {
+        *f /= n;
+    }
+    Some(DeconvGate {
+        step,
+        cols,
+        rows,
+        frac,
+    })
+}
+
 fn deconv_coeff(amount: f32, scale: f64, splat_def: f64) -> f64 {
     let a = amount as f64;
     if !(a > 0.0) || !splat_def.is_finite() || !(scale > 0.0) {
@@ -627,13 +697,27 @@ fn high_pass_noise(hp: &[f32]) -> f32 {
 /// one axis filter [-k, 1 + 2k, -k], so the splat blur along x and along y are
 /// both undone; a step edge is constant along y, which makes the second axis of
 /// the inverse an identity there and keeps the overshoot one dimensional.
-fn deconvolve_planes(planes: &mut [Vec<u16>; CHANNELS], w: usize, h: usize, k: f32, span: f32) {
+fn deconvolve_planes(
+    planes: &mut [Vec<u16>; CHANNELS],
+    w: usize,
+    h: usize,
+    k: f32,
+    span: f32,
+    motion_gate: Option<(&DeconvGate, usize, usize, usize)>,
+) {
     for plane in planes.iter_mut() {
-        deconvolve_plane(plane, w, h, k, span);
+        deconvolve_plane(plane, w, h, k, span, motion_gate);
     }
 }
 
-fn deconvolve_plane(plane: &mut [u16], w: usize, h: usize, k: f32, span: f32) {
+fn deconvolve_plane(
+    plane: &mut [u16],
+    w: usize,
+    h: usize,
+    k: f32,
+    span: f32,
+    motion_gate: Option<(&DeconvGate, usize, usize, usize)>,
+) {
     let n = w * h;
     if n == 0 || w < 2 || h < 2 || !(k > 0.0) {
         return;
@@ -680,6 +764,19 @@ fn deconvolve_plane(plane: &mut [u16], w: usize, h: usize, k: f32, span: f32) {
                 let y = y0 + r;
                 let y_lo = y.saturating_sub(1);
                 let y_hi = (y + 1).min(h - 1);
+                // Motion gate: the crop origin (x0, y0) and the output grid
+                // density map this row onto a sensor block row.
+                let block_row = motion_gate.map(|(g, _x0, y0c, kden)| {
+                    let sensor_y = (y + y0c) / kden.max(1);
+                    (sensor_y / g.step).min(g.rows - 1) * g.cols
+                });
+                let (g_step, g_x0, g_kden, g_cols, g_frac): (usize, usize, usize, usize, &[f32]) =
+                    match motion_gate {
+                        Some((g, x0c, _y0c, kden)) => {
+                            (g.step, x0c, kden, g.cols, &g.frac[..])
+                        }
+                        None => (0, 0, 1, 0, &[][..]),
+                    };
                 for x in 0..w {
                     let i = y * w + x;
                     let (mut lo, mut hi) = (f32::MAX, f32::MIN);
@@ -696,7 +793,12 @@ fn deconvolve_plane(plane: &mut [u16], w: usize, h: usize, k: f32, span: f32) {
                         }
                     }
                     let h = hp[i];
-                    let corr = k * h * if gate2 > 0.0 { h * h / (h * h + gate2) } else { 1.0 };
+                    let mut corr = k * h * if gate2 > 0.0 { h * h / (h * h + gate2) } else { 1.0 };
+                    if let (Some(base), true) = (block_row, g_cols > 0) {
+                        let sensor_x = (x + g_x0) / g_kden.max(1);
+                        let col = (sensor_x / g_step).min(g_cols - 1);
+                        corr *= 1.0 - g_frac[base + col];
+                    }
                     let lim = (DECONV_CLAMP_FRAC * (hi - lo)).max(clamp_abs);
                     let v = (cur[i] + corr).clamp(lo - lim, hi + lim).clamp(0.0, span);
                     dst[r * w + x] = v.round() as u16;
@@ -716,6 +818,49 @@ fn cr_weights(f: f32) -> [f32; 4] {
         -1.5 * f3 + 2.0 * f2 + 0.5 * f,
         0.5 * f3 - 0.5 * f2,
     ]
+}
+
+/// Sensor-pixel rectangle covered by every used frame after the rigid
+/// alignment: the intersection of the axis aligned boxes of the mapped frame
+/// rectangles. The reference frame (identity) bounds the result; the box of a
+/// rotated frame overestimates its true area, which only makes the crop a
+/// little more conservative.
+pub fn stabilized_rect_pub(
+    shifts: &[Shift],
+    used: &[usize],
+    w: usize,
+    h: usize,
+) -> (usize, usize, usize, usize) {
+    stabilized_rect(shifts, used, w, h)
+}
+
+fn stabilized_rect(shifts: &[Shift], used: &[usize], w: usize, h: usize) -> (usize, usize, usize, usize) {
+    let (mut x0, mut y0, mut x1, mut y1) = (0usize, 0usize, w, h);
+    for &i in used {
+        let s = shifts.get(i).copied().unwrap_or_default();
+        let (cx, cy) = (w as f64 * 0.5, h as f64 * 0.5);
+        let corners = [
+            (0.0, 0.0),
+            (w as f64, 0.0),
+            (0.0, h as f64),
+            (w as f64, h as f64),
+        ];
+        let (mut fx0, mut fy0, mut fx1, mut fy1) =
+            (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for (px, py) in corners {
+            let (mx, my) = s.map(px, py, cx, cy);
+            fx0 = fx0.min(mx);
+            fy0 = fy0.min(my);
+            fx1 = fx1.max(mx);
+            fy1 = fy1.max(my);
+        }
+        x0 = x0.max(fx0.ceil().max(0.0) as usize);
+        y0 = y0.max(fy0.ceil().max(0.0) as usize);
+        x1 = x1.min(fx1.floor().min(w as f64).max(0.0) as usize);
+        y1 = y1.min(fy1.floor().min(h as f64).max(0.0) as usize);
+    }
+    // One sample of margin on each side keeps the splat footprint covered.
+    (x0.min(w), y0.min(h), x1.max(x0 + 1), y1.max(y0 + 1))
 }
 
 fn crop_plane(src: &[u16], stride: usize, x: usize, y: usize, w: usize, h: usize) -> Vec<u16> {

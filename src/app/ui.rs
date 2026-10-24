@@ -412,6 +412,20 @@ fn options_panel(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
     });
     ui.horizontal(|ui| {
         ui.checkbox(
+            &mut state.options.stabilize,
+            lang.t("electronic stabilization", "электронная стабилизация"),
+        );
+        ui.label(
+            egui::RichText::new(lang.t(
+                "crop to the frames' overlap",
+                "кроп до пересечения кадров",
+            ))
+            .small()
+            .weak(),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(
             &mut state.options.motion_enabled,
             lang.t("motion compensation", "компенсация движения"),
         );

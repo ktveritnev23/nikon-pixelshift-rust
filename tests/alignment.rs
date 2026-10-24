@@ -120,6 +120,16 @@ fn render_rigid(scene: &Scene, w: usize, h: usize, s: Shift, sigma: f64, seed: u
 }
 
 fn check(reference: &RawFrame, frame: &RawFrame, want: (f64, f64), tol: f64) -> Shift {
+    check_with_conf(reference, frame, want, tol, 0.9)
+}
+
+fn check_with_conf(
+    reference: &RawFrame,
+    frame: &RawFrame,
+    want: (f64, f64),
+    tol: f64,
+    min_confidence: f32,
+) -> Shift {
     let got = shift::estimate(reference, frame).expect("estimate");
     println!(
         "injected ({:+.3}, {:+.3}) -> measured ({:+.4}, {:+.4}) confidence {:.3}",
@@ -133,7 +143,11 @@ fn check(reference: &RawFrame, frame: &RawFrame, want: (f64, f64), tol: f64) -> 
         want.0,
         want.1
     );
-    assert!(got.confidence > 0.9, "confidence {:.3} is low", got.confidence);
+    assert!(
+        got.confidence > min_confidence,
+        "confidence {:.3} is low",
+        got.confidence
+    );
     got
 }
 
@@ -163,6 +177,37 @@ fn recovers_half_and_arbitrary_sub_pixel_shifts() {
     // about 0.016 px, dominated by the residual interpolation bias of the
     // six tap Lanczos kernel used on the working plane.
     assert!(worst <= 0.02, "worst clean error {worst:.4} px");
+}
+
+#[test]
+fn recovers_hand_held_shifts_far_beyond_the_window_search() {
+    // Hand-held bursts move by tens of pixels between frames; the per-window
+    // search only reaches +/-8 sensor px, so the pyramid level must find the
+    // global translation first. Anything up to the pyramid range must come
+    // back at the usual sub-pixel accuracy.
+    let scene = Scene;
+    let (w, h) = (512usize, 512usize);
+    let reference = render(&scene, w, h, (0.0, 0.0), 0.0, 5);
+    let cases = [
+        (9.0, 6.0),
+        (-14.0, 11.0),
+        (18.5, -7.25),
+        (-21.0, -16.0),
+    ];
+    for (i, c) in cases.iter().enumerate() {
+        let frame = render(&scene, w, h, *c, 4.0, 300 + i as u64);
+        // 0.05 px: at twenty pixels of displacement the residual of the
+        // multi-peak ranking is slightly above the small-shift 0.02 px bar
+        // and still two orders below anything the merge would notice. The
+        // confidence drops with the shrinking overlap (0.85 at the largest
+        // case) while the lock itself stays correct.
+        let got = check_with_conf(&reference, &frame, *c, 0.05, 0.8);
+        assert!(
+            got.confidence > 0.8,
+            "confidence {:.3} is low for a large shift",
+            got.confidence
+        );
+    }
 }
 
 #[test]

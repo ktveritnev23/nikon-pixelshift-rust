@@ -184,6 +184,11 @@ pub struct MergeArgs {
     /// Do not estimate shifts; merge as if every frame were aligned.
     #[arg(long)]
     pub no_align: bool,
+    /// Electronic stabilization: crop the output to the rectangle every frame
+    /// covers after alignment (the common overlap). A hand-held burst then
+    /// yields a slightly smaller, correctly merged image.
+    #[arg(long)]
+    pub stabilize: bool,
     /// Do not copy the vendor maker note (EXIF 0x927C) of the reference file
     /// into the DNG. Copying is the default because raw editors identify a
     /// first party lens, and therefore its profile, from the maker note.
@@ -212,6 +217,7 @@ impl MergeArgs {
             deconvolve: self
                 .deconvolve
                 .unwrap_or_else(|| MergeParams::default().deconvolve),
+            stabilize: self.stabilize,
             motion_enabled: self.motion,
             motion_sensitivity: self.motion_sensitivity,
             also_1x: self.also_1x,
@@ -230,6 +236,9 @@ pub struct InspectArgs {
     /// Do not estimate shifts (skips decoding the remaining frames).
     #[arg(long)]
     pub no_align: bool,
+    /// Report the crop electronic stabilization would apply.
+    #[arg(long)]
+    pub stabilize: bool,
     /// Also run the motion detector and report the masked share per frame.
     #[arg(long)]
     pub motion: bool,
@@ -718,6 +727,7 @@ fn run_inspect(args: InspectArgs) -> Result<()> {
             } else {
                 None
             },
+            args.stabilize,
         ) {
             Ok(()) => {}
             Err(error) => {
@@ -737,12 +747,33 @@ fn inspect_one(
     align: bool,
     distort: crate::distort::Distortion,
     motion: Option<crate::types::MotionParams>,
+    stabilize: bool,
 ) -> Result<()> {
     let frames = pipeline::decode(&series.files)?;
     let first = frames
         .first()
         .ok_or_else(|| anyhow::anyhow!("{}: no frames", series.name()))?;
     let shifts = pipeline::estimate_shifts(&frames, align)?;
+    if stabilize {
+        let used: Vec<usize> = (0..frames.len()).collect();
+        let (x0, y0, x1, y1) = crate::merge::stabilized_rect_pub(
+            &shifts,
+            &used,
+            first.width,
+            first.height,
+        );
+        println!(
+            "  stabilize  crop to {} x {} of {} x {} (edges {}, {}, {}, {})",
+            x1 - x0,
+            y1 - y0,
+            first.width,
+            first.height,
+            x0,
+            y0,
+            first.width - x1,
+            first.height - y1
+        );
+    }
     let masked = motion.map(|params| {
         let masks = crate::motion::masks(&frames, &shifts, &params);
         masks

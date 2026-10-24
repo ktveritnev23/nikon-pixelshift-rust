@@ -38,6 +38,11 @@ const SAMPLE_STRIDE: usize = 2;
 /// Blocks with fewer masked 8-neighbours than this are dropped as noise
 /// spikes (before dilation).
 const MIN_NEIGHBOURS: usize = 1;
+/// Safety factor on the alignment residual when converting it into an
+/// expected static disagreement: the residual is a fit RMS over windows, the
+/// local error at the frame corners is larger.
+const RESIDUAL_MARGIN: f64 = 2.0;
+
 /// Absolute floor of the local median energy, so that a perfectly flat
 /// neighbourhood (median ~ 0) cannot flag every nonzero block above it. In
 /// block-sum ADU^2: noise of 4 ADU per lattice sample difference.
@@ -62,6 +67,13 @@ pub fn masks(
     }
     let reference_plane = luma_plane(reference, Rect::new(0, 0, lw, lh));
     let threshold = THRESHOLD / params.sensitivity.max(0.05);
+    // Temporal pair distances: a quarter of the series and the full span.
+    let mut distances: Vec<usize> = [n / 4, n - 1]
+        .into_iter()
+        .filter(|&k| k >= 2 && k < n)
+        .collect();
+    distances.sort_unstable();
+    distances.dedup();
 
     (0..n)
         .into_par_iter()
@@ -69,7 +81,18 @@ pub fn masks(
             if i == 0 {
                 return None;
             }
-            detect_one(&reference_plane, &frames[i], &shifts[i], threshold)
+            let pairs: Vec<(&RawFrame, &Shift)> = distances
+                .iter()
+                .filter_map(|&k| {
+                    let j = i + k;
+                    if j < n {
+                        Some((&frames[j], &shifts[j]))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            detect_one(&reference_plane, &frames[i], &shifts[i], threshold, &pairs)
         })
         .collect()
 }
@@ -80,6 +103,7 @@ fn detect_one(
     frame: &RawFrame,
     shift: &Shift,
     threshold: f32,
+    pairs: &[(&RawFrame, &Shift)],
 ) -> Option<MotionMask> {
     let (lw, lh) = (reference.w, reference.h);
     let frame_plane = luma_plane(frame, Rect::new(0, 0, frame.width / 2, frame.height / 2));
@@ -103,6 +127,11 @@ fn detect_one(
     let cols = lw.div_ceil(BLOCK_LATTICE);
     let rows = lh.div_ceil(BLOCK_LATTICE);
     let mut energies = vec![0.0f32; cols * rows];
+    let mut grad_rms = vec![0.0f32; cols * rows];
+    // Registration error the rigid model leaves on this frame: a static but
+    // busy block disagrees by about |gradient| * residual, which the pure
+    // noise floor would flag as motion.
+    let residual = (shift.residual.max(0.0) as f64 * RESIDUAL_MARGIN) as f32;
 
     for by in 0..rows {
         let y0 = by * BLOCK_LATTICE;
@@ -111,6 +140,7 @@ fn detect_one(
             let x0 = bx * BLOCK_LATTICE;
             let x1 = (x0 + BLOCK_LATTICE).min(lw);
             let mut acc = 0.0f64;
+            let mut grad2 = 0.0f64;
             let mut count = 0usize;
             let mut y = y0;
             while y < y1 {
@@ -139,6 +169,15 @@ fn detect_one(
                         let ty = taps(fy.fract());
                         let v = sample_taps(&frame_plane, fx.floor() as i64, fy.floor() as i64, &tx, &ty);
                         let r = reference.data[ref_row + x];
+                        if x > 0 && x + 1 < lw && y > 0 && y + 1 < lh {
+                            let gx = 0.5
+                                * (reference.data[ref_row + x + 1] - reference.data[ref_row + x - 1])
+                                as f64;
+                            let gy = 0.5
+                                * (reference.data[(y + 1) * lw + x] - reference.data[(y - 1) * lw + x])
+                                as f64;
+                            grad2 += gx * gx + gy * gy;
+                        }
                         if r < sat_limit && v < sat_limit {
                             let diff = v - r;
                             acc += diff as f64 * diff as f64;
@@ -153,11 +192,83 @@ fn detect_one(
             // the frame border are border artefacts, not motion: their
             // shorter average has a much heavier noise tail.
             let nominal = (BLOCK_LATTICE / SAMPLE_STRIDE) * (BLOCK_LATTICE / SAMPLE_STRIDE);
-            energies[by * cols + bx] = if count * 2 >= nominal {
-                (acc / count.max(1) as f64) as f32
-            } else {
-                0.0
-            };
+            if count * 2 >= nominal {
+                energies[by * cols + bx] = (acc / count.max(1) as f64) as f32;
+                // Expected static disagreement of a busy block under the
+                // residual registration error: |gradient| * residual.
+                grad_rms[by * cols + bx] =
+                    ((grad2 / count.max(1) as f64).sqrt() * residual as f64) as f32;
+            }
+        }
+    }
+
+    // Fold in the temporal pair energies (same block grid): slow motion
+    // displaces less than a block per frame and hides in the reference
+    // difference, but K captures apart it has crossed a block.
+    for (other, other_shift) in pairs {
+        let other_plane = luma_plane(other, Rect::new(0, 0, other.width / 2, other.height / 2));
+        let (ca, sa, a0, a1) = lattice_affine(shift, frame.width, frame.height);
+        let (cb, sb, b0, b1) = lattice_affine(other_shift, other.width, other.height);
+        // Composed affine lattice_i -> lattice_j = A_j * A_i^-1.
+        let m00 = cb * ca + sb * sa;
+        let m01 = cb * sa - sb * ca;
+        let m10 = -sb * ca + cb * sa;
+        let m11 = -sb * sa - cb * ca;
+        let o0 = b0 - (m00 * a0 + m01 * a1);
+        let o1 = b1 - (m10 * a0 + m11 * a1);
+        for by in 0..rows {
+            let y0 = by * BLOCK_LATTICE;
+            let y1 = (y0 + BLOCK_LATTICE).min(lh);
+            for bx in 0..cols {
+                let x0 = bx * BLOCK_LATTICE;
+                let x1 = (x0 + BLOCK_LATTICE).min(lw);
+                let mut acc = 0.0f64;
+                let mut count = 0usize;
+                let mut y = y0;
+                while y < y1 {
+                    let row = y * lw;
+                    let mut x = x0;
+                    while x < x1 {
+                        let fx = m00 * x as f64 + m01 * y as f64 + o0;
+                        let fy = m10 * x as f64 + m11 * y as f64 + o1;
+                        if fx >= 3.0
+                            && fx <= other_plane.w as f64 - 4.0
+                            && fy >= 3.0
+                            && fy <= other_plane.h as f64 - 4.0
+                        {
+                            let tx = taps(fx.fract());
+                            let ty = taps(fy.fract());
+                            let v = sample_taps(
+                                &other_plane,
+                                fx.floor() as i64,
+                                fy.floor() as i64,
+                                &tx,
+                                &ty,
+                            );
+                            let r = frame_plane.data[row + x];
+                            if r < sat_limit && v < sat_limit {
+                                let diff = v - r;
+                                acc += diff as f64 * diff as f64;
+                            }
+                            count += 1;
+                        }
+                        x += SAMPLE_STRIDE;
+                    }
+                    y += SAMPLE_STRIDE;
+                }
+                let nominal =
+                    (BLOCK_LATTICE / SAMPLE_STRIDE) * (BLOCK_LATTICE / SAMPLE_STRIDE);
+                if count * 2 >= nominal {
+                    let e = (acc / count.max(1) as f64) as f32;
+                    let i = by * cols + bx;
+                    if e > energies[i] {
+                        energies[i] = e;
+                        // The static gradient expectation no longer applies
+                        // where the pair says the block really moved.
+                        grad_rms[i] = 0.0;
+                    }
+                }
+            }
         }
     }
 
@@ -180,7 +291,8 @@ fn detect_one(
             }
             window.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let median = window[window.len() / 2];
-            let floor = median.max(ENERGY_FLOOR);
+            let misregistration = grad_rms[by * cols + bx].powi(2);
+            let floor = median.max(misregistration).max(ENERGY_FLOOR);
             flagged[by * cols + bx] = energies[by * cols + bx] > threshold * floor;
         }
     }
@@ -266,6 +378,17 @@ fn dilate(mask: &[bool], cols: usize, rows: usize) -> Vec<bool> {
             false
         })
         .collect()
+}
+
+/// Lattice-to-lattice affine constants of a rigid shift, mapping a reference
+/// lattice point to the frame lattice (the same constants detect_one builds
+/// inline): fx = cos*x + sin*y + c0, fy = -sin*x + cos*y + c1.
+fn lattice_affine(shift: &Shift, width: usize, height: usize) -> (f64, f64, f64, f64) {
+    let (sin, cos) = shift.rot.sin_cos();
+    let (cx, cy) = (width as f64 * 0.5, height as f64 * 0.5);
+    let c0 = 0.5 * (cx + cos * (1.0 - cx - shift.dx) + sin * (1.0 - cy - shift.dy) - 1.0);
+    let c1 = 0.5 * (cy - sin * (1.0 - cx - shift.dx) + cos * (1.0 - cy - shift.dy) - 1.0);
+    (cos, sin, c0, c1)
 }
 
 #[cfg(test)]

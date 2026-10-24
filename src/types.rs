@@ -362,6 +362,11 @@ pub struct MergeParams {
     pub min_coverage: f32,
     /// Throw away the outermost pixels whose colour coverage is incomplete.
     pub crop_uncovered: bool,
+    /// Electronic stabilization: crop the output to the rectangle covered by
+    /// every frame after alignment (the common overlap), so a hand-held burst
+    /// yields a slightly smaller but correctly merged image instead of a full
+    /// size one with misaligned borders.
+    pub stabilize: bool,
     /// Keep all redundant samples (8/32 frame modes) and average them.
     pub denoise: bool,
     /// Optional residual correction grid per frame (same order as `shifts`).
@@ -388,6 +393,7 @@ impl Default for MergeParams {
             shifts: Vec::new(),
             min_coverage: 0.25,
             crop_uncovered: false,
+            stabilize: false,
             denoise: true,
             grids: Vec::new(),
             motion: MotionParams::default(),

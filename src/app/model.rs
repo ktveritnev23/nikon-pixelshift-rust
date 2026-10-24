@@ -120,6 +120,9 @@ pub struct EditOptions {
     pub tiff_render: bool,
     /// Strength of the merge deconvolution, see `MergeParams::deconvolve`.
     pub deconvolve: f32,
+    /// Electronic stabilization: crop the output to the common overlap of the
+    /// aligned frames, see `MergeParams::stabilize`.
+    pub stabilize: bool,
     /// Mask scene motion out of the merge, see `MergeParams::motion`.
     pub motion_enabled: bool,
     /// Motion detection sensitivity (1.0 = the tuned default).
@@ -141,6 +144,7 @@ impl Default for EditOptions {
             flavor: DngFlavor::LinearRaw,
             tiff_render: true,
             deconvolve: MergeParams::default().deconvolve,
+            stabilize: false,
             motion_enabled: false,
             motion_sensitivity: 1.0,
             distort: crate::distort::Distortion::IDENTITY,
@@ -157,6 +161,7 @@ impl EditOptions {
             scale,
             align: self.align,
             shifts,
+            stabilize: self.stabilize,
             deconvolve: self.deconvolve,
             motion: MotionParams {
                 enabled: self.motion_enabled,

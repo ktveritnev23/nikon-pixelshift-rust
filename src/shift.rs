@@ -51,19 +51,30 @@ const BLUR_RADIUS: i32 = 3;
 const BLUR_SIGMA: f32 = 0.8;
 const MAX_ITER: usize = 24;
 const ITER_TOL: f64 = 1e-4;
-/// Windows disagreeing with the rigid model by more than this are dropped.
-const OUTLIER_PX: f64 = 0.12;
-/// Physical limit of the pixel shift mechanism (about 400 arc seconds). Measured
-/// series reach 200 .. 320 arc seconds: warping a frame onto the reference with
-/// the rotation halves the residual on real pixels (mean 23.9 -> 12.3 ADU on
-/// 106 frame 1, corner window 46.9 -> 20.0), so the rotation must be kept. A fit
-/// beyond this limit is degenerate and falls back to a pure translation.
-const MAX_ROT: f64 = 2.0e-3;
+/// Upper bound on a believable inter-frame rotation. Tripod pixel shift stays
+/// below 400 arc seconds (the mechanism limit), hand-held shake reaches 400..
+/// 600" per frame: the rotation must be accepted there, otherwise the pure
+/// translation fit leaves a multi-pixel residual. Degenerate fits on repetitive
+/// scenes are caught by the ROT_GAIN test and the window outliers instead of
+/// this cap (which only stops runaway numbers).
+const MAX_ROT: f64 = 1.2e-2;
 /// A rotation is only accepted when it lowers the residual to this fraction.
 const ROT_GAIN: f64 = 0.8;
+/// Inlier band of the RANSAC consensus, in sensor px: real window locks on a
+/// static scene agree to well below 0.3 px, object windows deviate by pixels.
+const RANSAC_TOL: f64 = 1.0;
 /// Windows below this fraction of the best texture energy are ignored by the
 /// fit: defocused parts of the frame measure as noise only.
 const MIN_ENERGY: f64 = 0.05;
+/// Decimation of the whole-frame pyramid level used for the global
+/// translation estimate (in lattice px).
+const PYRAMID_FACTOR: usize = 8;
+/// Search radius at that level: 16 decimated px = 256 sensor px, far above
+/// any hand-held shake, while the NCC over the ~380x250 level stays cheap.
+const PYRAMID_RADIUS: i32 = 16;
+/// Coarse candidates refined and ranked before the window pass: repetitive
+/// scenes put several quasi-periodic peaks within a few hundredths of NCC.
+const ALIGN_CANDIDATES: usize = 5;
 
 /// Single channel f32 plane with clamped Catmull-Rom sampling.
 pub(crate) struct Plane {
@@ -145,7 +156,8 @@ pub(crate) fn sample_taps(p: &Plane, base_x: i64, base_y: i64, tx: &Taps, ty: &T
 pub fn estimate(reference: &RawFrame, frame: &RawFrame) -> Result<Shift> {
     check_pair(reference, frame)?;
     let preps = build_preps(reference);
-    Ok(measure(&preps, frame, reference.width, reference.height).0)
+    let global = GlobalPrep::build(reference);
+    Ok(measure(&preps, &global, frame, reference.width, reference.height).0)
 }
 
 /// Rigid transform, the local residual grid of one frame, and the correlation
@@ -186,12 +198,25 @@ pub fn estimate_series_with_grids(
         return Ok((shifts, grids));
     }
     let preps = build_preps(first);
+    let global = GlobalPrep::build(first);
     let direct: Vec<Measurement> = frames[1..]
         .par_iter()
-        .map(|f| measure(&preps, f, first.width, first.height))
+        .map(|f| measure(&preps, &global, f, first.width, first.height))
         .collect();
     let mut weak = vec![false; frames.len()];
     for (i, (s, g, ncc)) in direct.into_iter().enumerate() {
+        if std::env::var_os("PIXELSHIFT_DEBUG_SHIFT").is_some() {
+            eprintln!(
+                "direct frame {}: ({:+.3}, {:+.3}) rot {:+.1}\" residual {:.3} ncc {:.3} weak {}",
+                i + 1,
+                s.dx,
+                s.dy,
+                s.rot_arcsec(),
+                s.residual,
+                ncc,
+                ncc < DIRECT_NCC
+            );
+        }
         shifts[i + 1] = s;
         grids[i + 1] = g;
         weak[i + 1] = ncc < DIRECT_NCC;
@@ -209,6 +234,17 @@ pub fn estimate_series_with_grids(
         let Ok(step) = estimate(&frames[i - 1], &frames[i]) else {
             continue;
         };
+        if std::env::var_os("PIXELSHIFT_DEBUG_SHIFT").is_some() {
+            eprintln!(
+                "chained frame {} through {}: step ({:+.3}, {:+.3}) residual {:.3} ncc-ish {:.3}",
+                i,
+                i - 1,
+                step.dx,
+                step.dy,
+                step.residual,
+                step.confidence
+            );
+        }
         shifts[i] = compose(prev, step);
         grids[i] = None;
     }
@@ -369,10 +405,115 @@ struct WindowEst {
     energy: f64,
 }
 
-/// Two stage measurement: the window nearest to the centre gives a global
-/// translation, which then initialises every window (a defocused corner can
-/// otherwise pull the Gauss-Newton iteration into a wrong minimum).
-fn measure(preps: &[CropPrep], frame: &RawFrame, width: usize, height: usize) -> Measurement {
+/// Whole-frame pyramid level of the reference, for the global translation
+/// estimate. Hand-held bursts move by tens of sensor pixels between frames -
+/// far beyond the per-window search radius - and a coarse NCC over the whole
+/// frame finds them where the narrow search would lock onto a wrong minimum.
+struct GlobalPrep {
+    coarse: Plane,
+    factor: usize,
+}
+
+impl GlobalPrep {
+    fn build(reference: &RawFrame) -> Self {
+        let full = luma_plane(reference, Rect::new(0, 0, reference.width / 2, reference.height / 2));
+        let factor = pyramid_factor(full.w, full.h);
+        Self {
+            coarse: pyramid_level(&full, factor.ilog2() as usize),
+            factor,
+        }
+    }
+}
+
+/// The coarse level must stay large enough for the search margins: shrink the
+/// decimation on small frames instead of producing a plane the NCC cannot
+/// even loop over.
+fn pyramid_factor(w: usize, h: usize) -> usize {
+    let mut factor = PYRAMID_FACTOR;
+    while factor > 1 && (w / factor < 96 || h / factor < 96) {
+        factor /= 2;
+    }
+    factor
+}
+
+/// One pyramid step: low pass, then halve the resolution. The blur must run
+/// BEFORE the decimation: the working planes hold content up to the lattice
+/// Nyquist frequency, and plain box decimation aliases it into false
+/// correlation peaks (a 9 px grating is period ~1 px three levels down).
+const PYRAMID_BLUR_RADIUS: i32 = 5;
+const PYRAMID_BLUR_SIGMA: f32 = 1.6;
+
+fn halve(p: &Plane) -> Plane {
+    let mut blurred = p.data.clone();
+    blur_with(&mut blurred, p.w, p.h, PYRAMID_BLUR_RADIUS, PYRAMID_BLUR_SIGMA);
+    let (w, h) = (p.w / 2, p.h / 2);
+    let mut data = vec![0.0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let r = (2 * y) * p.w + 2 * x;
+            data[y * w + x] = 0.25
+                * (blurred[r] + blurred[r + 1] + blurred[r + p.w] + blurred[r + p.w + 1]);
+        }
+    }
+    Plane { w, h, data }
+}
+
+/// Cascade the plane down by 2^steps with a low pass before every halving.
+fn pyramid_level(p: &Plane, steps: usize) -> Plane {
+    let mut level = Plane {
+        w: p.w,
+        h: p.h,
+        data: p.data.clone(),
+    };
+    for _ in 0..steps {
+        level = halve(&level);
+    }
+    level
+}
+
+/// Candidate global translations of one frame against the reference, in
+/// lattice px (the same convention as the window search: reference(x + s) ~
+/// frame(x)). Quasi-periodic scenes put several coarse NCC peaks within a few
+/// hundredths of each other, so the strongest `keep` peaks are returned and
+/// the caller ranks them after a full resolution refinement.
+fn global_shift_candidates(
+    global: &GlobalPrep,
+    frame: &RawFrame,
+    keep: usize,
+) -> Vec<(f64, f64)> {
+    let full = luma_plane(frame, Rect::new(0, 0, frame.width / 2, frame.height / 2));
+    let coarse = pyramid_level(&full, global.factor.ilog2() as usize);
+    let peaks = coarse_shift_top(&global.coarse, &coarse, (0, 0), PYRAMID_RADIUS, keep);
+    if std::env::var_os("PIXELSHIFT_DEBUG_SHIFT").is_some() {
+        eprintln!(
+            "global: coarse {}x{} factor {} peaks {:?}",
+            global.coarse.w,
+            global.coarse.h,
+            global.factor,
+            peaks
+        );
+    }
+    peaks
+        .into_iter()
+        .map(|((sx, sy), _)| {
+            (
+                sx as f64 * global.factor as f64,
+                sy as f64 * global.factor as f64,
+            )
+        })
+        .collect()
+}
+
+/// Pyramid + window measurement: the whole-frame coarse NCC initialises the
+/// central window (a defocused corner can otherwise pull the Gauss-Newton
+/// iteration into a wrong minimum), which then initialises every window.
+fn measure(
+    preps: &[CropPrep],
+    global: &GlobalPrep,
+    frame: &RawFrame,
+    width: usize,
+    height: usize,
+) -> Measurement {
     if preps.is_empty() {
         return (
             Shift {
@@ -399,26 +540,53 @@ fn measure(preps: &[CropPrep], frame: &RawFrame, width: usize, height: usize) ->
         })
         .map(|(i, _)| i)
         .unwrap_or(0);
-    let center_est = estimate_window(&preps[ci], frame, (0, 0), None);
-    let init = (center_est.dx * 0.5, center_est.dy * 0.5);
+    // Rank the coarse candidates by the texture weighted correlation of ALL
+    // windows at the refined translation: a single window of a repetitive
+    // scene is multi-modal (its local NCC can prefer a false offset), the
+    // whole field cannot.
+    let tgts: Vec<Plane> = preps.iter().map(|p| luma_plane(frame, p.rect)).collect();
+    let center = &preps[ci];
+    let center_tgt = &tgts[ci];
+    let energy_sum: f64 = preps.iter().map(|p| p.energy).sum::<f64>().max(1e-9);
+    let mut best: Option<((f64, f64), f32)> = None;
+    for cand in global_shift_candidates(global, frame, ALIGN_CANDIDATES) {
+        let search = (cand.0.round() as i32, cand.1.round() as i32);
+        let (ix, iy, _) = coarse_shift(&center.plane, center_tgt, search, SEARCH_RADIUS);
+        let s = refine(center, center_tgt, (ix as f64, iy as f64));
+        let mut score = 0.0f64;
+        for (prep, tgt) in preps.iter().zip(tgts.iter()) {
+            score += prep.energy * window_ncc(prep, tgt, s).max(0.0) as f64;
+        }
+        let score = (score / energy_sum) as f32;
+        if std::env::var_os("PIXELSHIFT_DEBUG_SHIFT").is_some() {
+            eprintln!(
+                "candidate ({:+.2}, {:+.2}) refined ({:+.2}, {:+.2}) field ncc {score:.4}",
+                cand.0, cand.1, s.0, s.1
+            );
+        }
+        if best.map_or(true, |b| score > b.1) {
+            best = Some((s, score));
+        }
+    }
+    let (init, _) = best.unwrap_or(((0.0, 0.0), 0.0));
     let search = (init.0.round() as i32, init.1.round() as i32);
     let ests: Vec<WindowEst> = preps
         .par_iter()
-        .map(|p| estimate_window(p, frame, search, Some(init)))
+        .zip(tgts.par_iter())
+        .map(|(p, t)| estimate_window_tgt(p, t, search, Some(init)))
         .collect();
     fit_rigid(&ests, cx, cy)
 }
 
-fn estimate_window(
+fn estimate_window_tgt(
     prep: &CropPrep,
-    frame: &RawFrame,
+    tgt: &Plane,
     search_center: (i32, i32),
     init: Option<(f64, f64)>,
 ) -> WindowEst {
-    let tgt = luma_plane(frame, prep.rect);
-    let (ix, iy, ncc) = coarse_shift(&prep.plane, &tgt, search_center);
+    let (ix, iy, ncc) = coarse_shift(&prep.plane, tgt, search_center, SEARCH_RADIUS);
     let s0 = init.unwrap_or((ix as f64, iy as f64));
-    let (dx, dy) = refine(prep, &tgt, s0);
+    let (dx, dy) = refine(prep, tgt, s0);
     let (x, y) = prep.center();
     WindowEst {
         x,
@@ -427,6 +595,79 @@ fn estimate_window(
         dy: 2.0 * dy,
         ncc,
         energy: prep.energy,
+    }
+}
+
+/// Exact rigid model through two window measurements, or None when the two
+/// windows share a position and carry no rotation information.
+fn rigid_from_two(a: &WindowEst, b: &WindowEst, cx: f64, cy: f64) -> Option<(f64, f64, f64)> {
+    let (ex, ey) = (a.x - b.x, a.y - b.y);
+    let den = ex * ex + ey * ey;
+    if den < 1.0 {
+        return None;
+    }
+    let rot = ((b.dx - a.dx) * ey + (a.dy - b.dy) * ex) / den;
+    let dx0 = a.dx + rot * (a.y - cy);
+    let dy0 = a.dy - rot * (a.x - cx);
+    Some((dx0, dy0, rot))
+}
+
+/// Consensus set of the window measurements: the rigid hypothesis whose
+/// inliers (windows within RANSAC_TOL of it) carry the largest total
+/// texture-weighted correlation, refined by two weighted LSQ refits.
+fn ransac_consensus(
+    ests: &[WindowEst],
+    initial: &[usize],
+    w: &[f64],
+    cx: f64,
+    cy: f64,
+) -> Vec<usize> {
+    if initial.len() < 3 {
+        return initial.to_vec();
+    }
+    let mut best: (Vec<usize>, f64) = (Vec::new(), -1.0);
+    for a in 0..initial.len() {
+        for b in (a + 1)..initial.len() {
+            let Some(model) = rigid_from_two(&ests[initial[a]], &ests[initial[b]], cx, cy) else {
+                continue;
+            };
+            if model.2.abs() > MAX_ROT {
+                continue;
+            }
+            let (mut inliers, mut score) = (Vec::new(), 0.0f64);
+            for &i in initial {
+                let (ex, ey) = expected(model, ests[i].x, ests[i].y, cx, cy);
+                let d2 = (ests[i].dx - ex).powi(2) + (ests[i].dy - ey).powi(2);
+                if d2 <= RANSAC_TOL * RANSAC_TOL {
+                    inliers.push(i);
+                    score += w[i] * ests[i].ncc.max(0.0) as f64;
+                }
+            }
+            if inliers.len() >= 3 && score > best.1 {
+                best = (inliers, score);
+            }
+        }
+    }
+    let (mut inliers, _) = best;
+    if inliers.is_empty() {
+        return initial.to_vec();
+    }
+    for _ in 0..2 {
+        if inliers.len() < 3 {
+            break;
+        }
+        let model = solve_rigid(ests, &inliers, w, cx, cy);
+        let rms = rms_of(ests, &inliers, w, model, cx, cy);
+        let tol = RANSAC_TOL.max(3.0 * rms);
+        inliers.retain(|&i| {
+            let (ex, ey) = expected(model, ests[i].x, ests[i].y, cx, cy);
+            ((ests[i].dx - ex).powi(2) + (ests[i].dy - ey).powi(2)).sqrt() <= tol
+        });
+    }
+    if inliers.len() >= 3 {
+        inliers
+    } else {
+        initial.to_vec()
     }
 }
 
@@ -457,22 +698,13 @@ fn fit_rigid(ests: &[WindowEst], cx: f64, cy: f64) -> Measurement {
         }
     }
 
-    let mut model = (0.0, 0.0, 0.0);
-    for pass in 0..3 {
-        model = solve_rigid(ests, &keep, &w, cx, cy);
-        let mut worst = (0usize, 0.0f64);
-        for (k, &i) in keep.iter().enumerate() {
-            let (ex, ey) = expected(model, ests[i].x, ests[i].y, cx, cy);
-            let d = ((ests[i].dx - ex).powi(2) + (ests[i].dy - ey).powi(2)).sqrt();
-            if d > worst.1 {
-                worst = (k, d);
-            }
-        }
-        if pass > 0 || keep.len() < 4 || worst.1 <= OUTLIER_PX.max(3.0 * rms_of(ests, &keep, &w, model, cx, cy)) {
-            break;
-        }
-        keep.remove(worst.0);
-    }
+    // RANSAC consensus instead of iterative worst-window removal: windows that
+    // sit on a large moving object lock onto the OBJECT displacement, and a
+    // least squares fit over everything splits the difference. Every window
+    // pair defines an exact rigid hypothesis; the one whose inliers carry the
+    // most texture-weighted correlation wins, then LSQ refits polish it.
+    let keep = ransac_consensus(ests, &keep, &w, cx, cy);
+    let model = solve_rigid(ests, &keep, &w, cx, cy);
 
     let total_w: f64 = keep.iter().map(|&i| w[i]).sum();
     let (mut tx, mut ty) = (0.0f64, 0.0f64);
@@ -762,10 +994,16 @@ pub(crate) fn luma_plane(frame: &RawFrame, rect: Rect) -> Plane {
 }
 
 fn blur(data: &mut [f32], w: usize, h: usize) {
-    let r = BLUR_RADIUS;
+    blur_with(data, w, h, BLUR_RADIUS, BLUR_SIGMA);
+}
+
+/// Gaussian blur with an explicit kernel; the pyramid levels need a stronger
+/// low pass (sigma 1.6) than the lattice build before they halve.
+fn blur_with(data: &mut [f32], w: usize, h: usize, r: i32, sigma: f32) {
+    let r = r;
     let mut k = Vec::with_capacity((2 * r + 1) as usize);
     for i in -r..=r {
-        k.push((-(i * i) as f32 / (2.0 * BLUR_SIGMA * BLUR_SIGMA)).exp());
+        k.push((-(i * i) as f32 / (2.0 * sigma * sigma)).exp());
     }
     let norm: f32 = k.iter().sum();
     for v in &mut k {
@@ -816,13 +1054,27 @@ fn gradients(p: &Plane) -> (Plane, Plane) {
 }
 
 /// Integer search by normalised cross correlation on a 2x decimated subset,
-/// around the supplied centre.
-fn coarse_shift(reference: &Plane, target: &Plane, center: (i32, i32)) -> (i32, i32, f32) {
-    let r = SEARCH_RADIUS;
+/// around the supplied centre, within `radius` px.
+fn coarse_shift(reference: &Plane, target: &Plane, center: (i32, i32), radius: i32) -> (i32, i32, f32) {
+    let mut best = coarse_shift_top(reference, target, center, radius, 1);
+    best.pop()
+        .map(|((sx, sy), ncc)| (sx, sy, ncc))
+        .unwrap_or((center.0, center.1, 0.0))
+}
+
+/// The strongest `keep` integer offsets of the NCC search below.
+fn coarse_shift_top(
+    reference: &Plane,
+    target: &Plane,
+    center: (i32, i32),
+    radius: i32,
+    keep: usize,
+) -> Vec<((i32, i32), f32)> {
+    let r = radius;
     let stride = 2usize;
     let margin = r as usize + BLUR_RADIUS as usize + 1;
     if reference.w <= 2 * margin + 8 || reference.h <= 2 * margin + 8 {
-        return (center.0, center.1, 0.0);
+        return Vec::new();
     }
     let (mut sb, mut sbb, mut n) = (0.0f64, 0.0f64, 0.0f64);
     let mut y = margin;
@@ -838,10 +1090,11 @@ fn coarse_shift(reference: &Plane, target: &Plane, center: (i32, i32)) -> (i32, 
         y += stride;
     }
     if n < 64.0 {
-        return (center.0, center.1, 0.0);
+        return vec![((center.0, center.1), 0.0)];
     }
     let var_b = (sbb - sb * sb / n).max(1e-6);
-    let mut best = (center.0, center.1, f32::NEG_INFINITY);
+    let mut peaks: Vec<((i32, i32), f32)> =
+        Vec::with_capacity(((2 * r + 1) * (2 * r + 1)) as usize);
     for sy in -r..=r {
         for sx in -r..=r {
             let (mut sa, mut saa, mut sab) = (0.0f64, 0.0f64, 0.0f64);
@@ -864,12 +1117,51 @@ fn coarse_shift(reference: &Plane, target: &Plane, center: (i32, i32)) -> (i32, 
             let var_a = (saa - sa * sa / n).max(1e-6);
             let cov = sab - sa * sb / n;
             let ncc = (cov / (var_a * var_b).sqrt()) as f32;
-            if ncc > best.2 {
-                best = (center.0 + sx, center.1 + sy, ncc);
-            }
+            peaks.push(((center.0 + sx, center.1 + sy), ncc));
         }
     }
-    best
+    peaks.sort_by(|a, b| b.1.total_cmp(&a.1));
+    peaks.truncate(keep);
+    peaks
+}
+
+/// Correlation of the window at a sub-pixel translation, used to rank
+/// candidate global shifts after their refinement.
+fn window_ncc(prep: &CropPrep, target: &Plane, s: (f64, f64)) -> f32 {
+    let inner = prep.inner;
+    let stride = if inner.w.min(inner.h) >= 256 {
+        REFINE_STRIDE
+    } else {
+        1
+    };
+    let fx0 = s.0.floor();
+    let fy0 = s.1.floor();
+    let tx = taps(s.0 - fx0);
+    let ty = taps(s.1 - fy0);
+    let (bx, by) = (fx0 as i64, fy0 as i64);
+    let (mut sa, mut sb, mut saa, mut sbb, mut sab, mut n) =
+        (0.0f64, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for py in (inner.y..inner.y + inner.h).step_by(stride) {
+        let base_y = py as i64 + by;
+        for px in (inner.x..inner.x + inner.w).step_by(stride) {
+            let base_x = px as i64 + bx;
+            let a = sample_taps(&prep.plane, base_x, base_y, &tx, &ty) as f64;
+            let b = target.data[py * target.w + px] as f64;
+            sa += a;
+            sb += b;
+            saa += a * a;
+            sbb += b * b;
+            sab += a * b;
+            n += 1.0;
+        }
+    }
+    if n < 2.0 {
+        return 0.0;
+    }
+    let var_a = (saa - sa * sa / n).max(1e-9);
+    let var_b = (sbb - sb * sb / n).max(1e-9);
+    let cov = sab - sa * sb / n;
+    (cov / (var_a * var_b).sqrt()) as f32
 }
 
 /// Gauss-Newton (Lucas-Kanade) refinement of a pure translation, in lattice
