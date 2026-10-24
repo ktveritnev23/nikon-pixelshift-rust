@@ -278,11 +278,15 @@ pub fn result(scale: u32, frames: &[RawFrame]) -> MergeResult {
 }
 
 /// Preview encoder used when merge::preview is not available yet.
+///
+/// `step` is the requested pyramid level for crops (1 = 1:1); the base
+/// preview keeps deriving its own factor from max_dim.
 pub fn encode(
     img: &MergeResult,
     rect: Option<(usize, usize, usize, usize)>,
     max_dim: u32,
     wb: [f32; 3],
+    step: u32,
 ) -> PreviewImage {
     let (x0, y0, w, h) = rect
         .map(|(x, y, w, h)| {
@@ -296,11 +300,14 @@ pub fn encode(
             )
         })
         .unwrap_or((0, 0, img.width, img.height));
-    let step = pipeline::downscale_step(w, h, max_dim);
+    let step = match rect {
+        Some(_) => step.max(1) as usize,
+        None => pipeline::downscale_step(w, h, max_dim),
+    };
     let out_w = (w / step).max(1);
     let out_h = (h / step).max(1);
     let white = img.white.max(1) as f32;
-    let mut rgb = vec![0u8; out_w * out_h * 3];
+    let mut buf = vec![0.0f32; out_w * out_h * 3];
     for oy in 0..out_h {
         for ox in 0..out_w {
             let mut sum = [0.0f32; 3];
@@ -321,15 +328,11 @@ pub fn encode(
             let idx = (oy * out_w + ox) * 3;
             for c in 0..3 {
                 let mean = if n > 0.0 { sum[c] / n } else { 0.0 };
-                rgb[idx + c] = pipeline::tone(mean * wb[c]);
+                buf[idx + c] = mean * wb[c];
             }
         }
     }
-    PreviewImage {
-        width: out_w,
-        height: out_h,
-        rgb,
-    }
+    crate::merge::encode_srgb(&buf, out_w, out_h)
 }
 
 /// Box average of a 2x result, used when merge::downsample_1x is unavailable.

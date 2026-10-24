@@ -395,31 +395,79 @@ pub fn preview(img: &MergeResult, max_dim: u32, wb: [f32; 3]) -> Result<PreviewI
 pub fn crop_preview(
     img: &MergeResult,
     rect: (usize, usize, usize, usize),
+    step: u32,
     wb: [f32; 3],
 ) -> Result<PreviewImage> {
-    guarded("merge::preview_crop (WP2)", || {
-        Ok(crate::merge::preview_crop(img, rect, wb))
+    guarded("merge::preview_crop_at (WP2)", || {
+        Ok(crate::merge::preview_crop_at(img, rect, step, wb))
     })
-    .context("building the 1:1 crop")
+    .context("building the crop")
 }
 
 /// Cheap colour preview of a single raw frame, used by the reference view.
 ///
-/// Every 2x2 CFA block becomes one pixel (R and B from their single sample, G
-/// from the two green samples), the white balance is applied and the result is
-/// gamma encoded. This never touches the merge work package, so the reference
-/// view works as soon as decoding works.
+/// With `rect = None` the whole frame is rendered at `max_dim` on the long
+/// side. With a rect the window is rendered at reduced detail: `step` CFA
+/// blocks per output sample, the rectangle aligned outward to whole blocks
+/// (2 * step native pixels), matching the merged view's pyramid level. The
+/// per-channel black level is subtracted, the white balance is applied and
+/// the result goes through the same sRGB encoder as the merged view (99.5
+/// percentile white point, sRGB curve). This never touches the merge work
+/// package, so the reference view works as soon as decoding works.
 pub fn reference_preview(
     frame: &RawFrame,
     rect: Option<(usize, usize, usize, usize)>,
     max_dim: u32,
     wb: [f32; 3],
+    step: u32,
 ) -> PreviewImage {
-    let (rx, ry, rw, rh) = rect.unwrap_or((0, 0, frame.width, frame.height));
-    let x0 = rx.min(frame.width.saturating_sub(2)) & !1;
-    let y0 = ry.min(frame.height.saturating_sub(2)) & !1;
-    let w = rw.min(frame.width - x0) & !1;
-    let h = rh.min(frame.height - y0) & !1;
+    let Some((rx, ry, rw, rh)) = rect else {
+        return reference_base_preview(frame, max_dim, wb);
+    };
+    let s = step.max(1) as usize;
+    let a = 2 * s;
+    let x0 = (rx.min(frame.width.saturating_sub(a)) / a) * a;
+    let y0 = (ry.min(frame.height.saturating_sub(a)) / a) * a;
+    let x1 = ((rx + rw).min(frame.width).max(x0 + a) + a - 1) / a * a;
+    let y1 = ((ry + rh).min(frame.height).max(y0 + a) + a - 1) / a * a;
+    let out_w = ((x1 - x0) / a).max(1);
+    let out_h = ((y1 - y0) / a).max(1);
+    let white = frame.white_span().max(1) as f32;
+    let mut buf = vec![0.0f32; out_w * out_h * 3];
+    for oy in 0..out_h {
+        for ox in 0..out_w {
+            let mut acc = [0.0f32; 3];
+            let mut n = [0.0f32; 3];
+            for by in 0..s {
+                for bx in 0..s {
+                    let px = x0 + (ox * s + bx) * 2;
+                    let py = y0 + (oy * s + by) * 2;
+                    if px + 1 >= frame.width || py + 1 >= frame.height {
+                        continue;
+                    }
+                    for (c, v) in block_channels(frame, px, py) {
+                        acc[c] += v as f32 / white;
+                        n[c] += 1.0;
+                    }
+                }
+            }
+            let idx = (oy * out_w + ox) * 3;
+            for c in 0..3 {
+                let mean = if n[c] > 0.0 { acc[c] / n[c] } else { 0.0 };
+                buf[idx + c] = mean * wb[c];
+            }
+        }
+    }
+    crate::merge::encode_srgb(&buf, out_w, out_h)
+}
+
+/// Whole frame reference preview: every 2x2 CFA block is one pixel, box
+/// averaged down to max_dim on the long side.
+fn reference_base_preview(frame: &RawFrame, max_dim: u32, wb: [f32; 3]) -> PreviewImage {
+    let x0 = 0;
+    let y0 = 0;
+    let w = frame.width & !1;
+    let h = frame.height & !1;
     let (w, h) = (w.max(2), h.max(2));
     let bw = w / 2;
     let bh = h / 2;
@@ -427,7 +475,7 @@ pub fn reference_preview(
     let out_w = (bw / step).max(1);
     let out_h = (bh / step).max(1);
     let white = frame.white_span().max(1) as f32;
-    let mut rgb = vec![0u8; out_w * out_h * 3];
+    let mut buf = vec![0.0f32; out_w * out_h * 3];
     for oy in 0..out_h {
         for ox in 0..out_w {
             let mut acc = [0.0f32; 3];
@@ -448,15 +496,11 @@ pub fn reference_preview(
             let idx = (oy * out_w + ox) * 3;
             for c in 0..3 {
                 let mean = if n[c] > 0.0 { acc[c] / n[c] } else { 0.0 };
-                rgb[idx + c] = tone(mean * wb[c]);
+                buf[idx + c] = mean * wb[c];
             }
         }
     }
-    PreviewImage {
-        width: out_w,
-        height: out_h,
-        rgb,
-    }
+    crate::merge::encode_srgb(&buf, out_w, out_h)
 }
 
 fn block_channels(frame: &RawFrame, x: usize, y: usize) -> [(usize, u16); 3] {
@@ -466,8 +510,11 @@ fn block_channels(frame: &RawFrame, x: usize, y: usize) -> [(usize, u16); 3] {
     let mut g_n = 0u32;
     for dy in 0..2 {
         for dx in 0..2 {
-            let v = frame.sample(x + dx, y + dy);
-            match frame.color_at(x + dx, y + dy) {
+            let color = frame.color_at(x + dx, y + dy);
+            let v = frame
+                .sample(x + dx, y + dy)
+                .saturating_sub(frame.black_for(color));
+            match color {
                 crate::types::Color::R => r = v,
                 crate::types::Color::B => b = v,
                 crate::types::Color::G => {
@@ -550,15 +597,101 @@ pub fn write_output(
     flavor: DngFlavor,
     tiff_render: bool,
 ) -> Result<u64> {
+    let compress = format.use_compression(compression);
     let opts = WriteOpts {
-        compress: format.use_compression(compression),
+        compress,
         preview_max: 0,
     };
     guarded("output writer (WP1)", || match format {
         OutFormat::Dng => crate::write::write_dng_with_flavor(path, img, meta, &opts, flavor),
-        OutFormat::Tiff if tiff_render => crate::write::write_tiff16_rendered(path, img, meta),
-        OutFormat::Tiff => crate::write::write_tiff16(path, img, meta),
+        OutFormat::Tiff if tiff_render => {
+            crate::write::write_tiff16_rendered(path, img, meta, compress)
+        }
+        OutFormat::Tiff => crate::write::write_tiff16(path, img, meta, compress),
     })
     .with_context(|| format!("writing {}", path.display()))?;
     Ok(std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Cfa;
+
+    /// Uniform frame whose channels are a neutral grey after the white
+    /// balance: native value = black + K / wb[c], so the WB-applied signal is
+    /// K / span in every channel. A black-subtracting preview must render it
+    /// channel-neutral; scaling the raw pedestal by wb[c] instead (the old
+    /// behaviour) tints it.
+    fn neutral_frame(wb: [f32; 3]) -> RawFrame {
+        let cfa = Cfa::from_pattern_str("RGGB").expect("RGGB");
+        let (black, white) = (1008u16, 16383u16);
+        let span = (white - black) as f32;
+        let k = 0.25 * span;
+        let mut data = vec![0u16; 64 * 64];
+        for y in 0..64 {
+            for x in 0..64 {
+                let c = cfa.0[y & 1][x & 1];
+                let value = black as f32 + k / wb[c.idx()].max(1e-3);
+                data[y * 64 + x] = value.min(white as f32) as u16;
+            }
+        }
+        RawFrame {
+            path: std::path::PathBuf::new(),
+            width: 64,
+            height: 64,
+            data,
+            cfa,
+            black,
+            cblack: [0; 4],
+            white,
+            wb: [wb[0], wb[1], wb[2], wb[1]],
+            cam_xyz: [[0f32; 3]; 4],
+            rgb_cam: [[0f32; 3]; 4],
+            iso: 100.0,
+            shutter: 1.0 / 125.0,
+            aperture: 5.6,
+            focal: 50.0,
+            lens_make: String::new(),
+            lens_model: String::new(),
+            focal_35mm: 50,
+            max_aperture: 1.8,
+            lens_min_focal: 50.0,
+            lens_max_focal: 50.0,
+            lens_min_fnum: 1.8,
+            lens_max_fnum: 1.8,
+            lens_serial: String::new(),
+            body_serial: String::new(),
+            make: String::new(),
+            model: String::new(),
+            timestamp: String::new(),
+            index: 0,
+        }
+    }
+
+    #[test]
+    fn reference_preview_renders_wb_matched_grey_neutral() {
+        let wb = [1.244f32, 1.0, 2.010];
+        let frame = neutral_frame(wb);
+        let image = reference_preview(&frame, None, 2048, wb, 1);
+        assert!(image.width > 0 && image.height > 0);
+        for p in image.rgb.chunks_exact(3) {
+            assert_eq!(p[0], p[1], "red must match green");
+            assert_eq!(p[1], p[2], "green must match blue");
+        }
+        // The patch sits at a quarter of the span, well above black.
+        assert!(image.rgb.iter().all(|&v| v > 16));
+    }
+
+    #[test]
+    fn reference_preview_subtracts_black() {
+        // Pedestal-only frame: with the black level subtracted every channel
+        // is zero, so the preview must be pure black regardless of wb.
+        let mut frame = neutral_frame([1.0, 1.0, 1.0]);
+        for v in frame.data.iter_mut() {
+            *v = frame.black;
+        }
+        let image = reference_preview(&frame, None, 2048, [1.244, 1.0, 2.010], 1);
+        assert!(image.rgb.iter().all(|&v| v == 0));
+    }
 }

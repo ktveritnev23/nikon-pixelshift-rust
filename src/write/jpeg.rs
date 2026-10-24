@@ -45,13 +45,15 @@ pub fn encode_rgb(rgb: &[u8], width: usize, height: usize) -> Vec<u8> {
     out.extend_from_slice(&ac_table.segment(0x10));
     sos(&mut out);
 
-    let mut bits = BitWriter::new(&mut out);
     let mut pred = [0i32; 3];
-    for (index, block) in coeffs.iter().enumerate() {
-        let component = index % 3;
-        encode_block(&mut bits, block, component, &dc_table, &ac_table, &mut pred);
+    {
+        let mut bits = BitWriter::new(&mut out);
+        for (index, block) in coeffs.iter().enumerate() {
+            let component = index % 3;
+            encode_block(&mut bits, block, component, &dc_table, &ac_table, &mut pred);
+        }
+        bits.finish();
     }
-    bits.finish();
     marker(&mut out, 0xd9); // EOI
     out
 }
@@ -61,7 +63,7 @@ fn marker(out: &mut Vec<u8>, code: u8) {
     out.push(code);
 }
 
-fn segment(out: &mut Vec<u8>, code: u8, body: &[u8]) {
+pub(crate) fn segment(out: &mut Vec<u8>, code: u8, body: &[u8]) {
     marker(out, code);
     out.extend_from_slice(&((body.len() + 2) as u16).to_be_bytes());
     out.extend_from_slice(body);
@@ -201,7 +203,7 @@ fn quantise(block: &[f32; 64], quant: &[u16; 64]) -> [i16; 64] {
     out
 }
 
-fn amplitude_bits(value: i32) -> u8 {
+pub(crate) fn amplitude_bits(value: i32) -> u8 {
     if value == 0 {
         0
     } else {
@@ -243,14 +245,14 @@ fn tables(coeffs: &[[i16; 64]]) -> (HuffmanTable, HuffmanTable) {
 
 /// Canonical Huffman table: optimal lengths for the used symbols, with the
 /// all-ones code left unused.
-struct HuffmanTable {
+pub(crate) struct HuffmanTable {
     counts: [u8; 16],
     symbols: Vec<u8>,
     codes: Vec<(u16, u8)>,
 }
 
 impl HuffmanTable {
-    fn build(freq: &[u32; 256]) -> Self {
+    pub(crate) fn build(freq: &[u32; 256]) -> Self {
         let mut used: Vec<(u32, u8)> = (0..256u32)
             .filter(|symbol| freq[*symbol as usize] > 0)
             .map(|symbol| (freq[symbol as usize], symbol as u8))
@@ -311,7 +313,7 @@ impl HuffmanTable {
         }
     }
 
-    fn segment(&self, class_id: u8) -> Vec<u8> {
+    pub(crate) fn segment(&self, class_id: u8) -> Vec<u8> {
         let mut body = Vec::with_capacity(2 + 16 + self.symbols.len());
         body.push(class_id);
         body.extend_from_slice(&self.counts);
@@ -321,13 +323,13 @@ impl HuffmanTable {
         out
     }
 
-    fn code(&self, symbol: u8) -> (u16, u8) {
+    pub(crate) fn code(&self, symbol: u8) -> (u16, u8) {
         self.codes[symbol as usize]
     }
 }
 
 fn encode_block(
-    bits: &mut BitWriter,
+    bits: &mut BitWriter<&mut Vec<u8>>,
     block: &[i16; 64],
     component: usize,
     dc: &HuffmanTable,
@@ -367,14 +369,14 @@ fn encode_block(
     }
 }
 
-struct BitWriter<'a> {
-    out: &'a mut Vec<u8>,
+pub(crate) struct BitWriter<W> {
+    out: W,
     acc: u32,
     used: u32,
 }
 
-impl<'a> BitWriter<'a> {
-    fn new(out: &'a mut Vec<u8>) -> Self {
+impl<W: std::io::Write> BitWriter<W> {
+    pub(crate) fn new(out: W) -> Self {
         Self {
             out,
             acc: 0,
@@ -382,7 +384,7 @@ impl<'a> BitWriter<'a> {
         }
     }
 
-    fn write(&mut self, value: u32, bits: u32) {
+    pub(crate) fn write(&mut self, value: u32, bits: u32) {
         if bits == 0 {
             return;
         }
@@ -390,17 +392,15 @@ impl<'a> BitWriter<'a> {
         self.used += bits;
         while self.used >= 8 {
             let byte = ((self.acc >> (self.used - 8)) & 0xff) as u8;
-            self.out.push(byte);
-            if byte == 0xff {
-                self.out.push(0x00);
-            }
+            let stuffed: &[u8] = if byte == 0xff { &[byte, 0x00] } else { &[byte] };
+            let _ = self.out.write_all(&stuffed);
             self.used -= 8;
         }
         // Drop the emitted bits so the next value starts right after them.
         self.acc &= (1u32 << self.used) - 1;
     }
 
-    fn write_amplitude(&mut self, value: i32, size: u8) {
+    pub(crate) fn write_amplitude(&mut self, value: i32, size: u8) {
         if size == 0 {
             return;
         }
@@ -409,7 +409,7 @@ impl<'a> BitWriter<'a> {
         self.write(encoded as u32, size as u32);
     }
 
-    fn finish(&mut self) {
+    pub(crate) fn finish(&mut self) {
         if self.used > 0 {
             let pad = 8 - self.used;
             self.write((1u32 << pad) - 1, pad);

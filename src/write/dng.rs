@@ -11,17 +11,16 @@
 //! 2) for readers that reject a raw main image; LibRaw refuses that, which is
 //! exactly why linearraw stays the default.
 //!
-//! `WriteOpts::compress` selects Deflate; note that LibRaw (0.22, dcraw_emu)
-//! cannot unpack 16 bit Deflate DNGs ("Corrupted data"), so uncompressed output
-//! is the interoperable choice and the tests check both paths.
+//! `WriteOpts::compress` selects lossless JPEG (Compression = 7, the same
+//! process the DNG specification and Nikon's own NEFs use), so the compressed
+//! file stays readable by LibRaw; every strip is an independent JPEG stream.
 
 use crate::types::{DngMeta, MergeResult, WriteOpts};
 use crate::write::color::{camera_to_srgb, encode_srgb_u8, mul3};
 use crate::write::jpeg;
+use crate::write::ljpeg;
 use crate::write::tiff::{self, Ifd, Value};
 use anyhow::{bail, Context, Result};
-use flate2::write::ZlibEncoder;
-use flate2::Compression;
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -151,7 +150,10 @@ fn write_inner<W: Write + Seek>(
 ) -> Result<()> {
     let width = img.width;
     let height = img.height;
-    let strips = height.div_ceil(ROWS_PER_STRIP);
+    // Lossless JPEG is written as one strip spanning the image: LibRaw's
+    // DNG loader cannot walk a multi-strip lossless JPEG layout.
+    let rows_per_strip = if opts.compress { height } else { ROWS_PER_STRIP };
+    let strips = height.div_ceil(rows_per_strip);
     let (preview_w, preview_h, preview) = build_preview(img, meta, opts.preview_max);
     let (jpeg_w, jpeg_h, jpeg_rgb) = build_preview(img, meta, JPEG_PREVIEW_MAX);
     let jpeg = jpeg::encode_rgb(&jpeg_rgb, jpeg_w, jpeg_h);
@@ -159,7 +161,16 @@ fn write_inner<W: Write + Seek>(
     // First pass: sizes of the directories (they do not depend on the values
     // that are only known once the layout is fixed).
     let mut main_ifd = Ifd::new();
-    fill_main_ifd(&mut main_ifd, img, meta, opts, flavor, strips, 0);
+    fill_main_ifd(
+        &mut main_ifd,
+        img,
+        meta,
+        opts,
+        flavor,
+        strips,
+        rows_per_strip,
+        0,
+    );
     let main_size = main_ifd.size();
     // The Exif IFD sits right after IFD0; it is reached through tag 0x8769 and
     // is deliberately not part of the next-IFD chain.
@@ -211,6 +222,7 @@ fn write_inner<W: Write + Seek>(
         opts,
         flavor,
         strips,
+        rows_per_strip,
         exif_ifd_off as u32,
     );
     if main_ifd.size() != main_size {
@@ -243,27 +255,33 @@ fn write_inner<W: Write + Seek>(
     let mut offsets: Vec<u32> = Vec::with_capacity(strips);
     let mut counts: Vec<u32> = Vec::with_capacity(strips);
     let mut raw: Vec<u8> = Vec::new();
-    let mut packed: Vec<u8> = Vec::new();
     let mut written = 0u64;
 
-    for strip in 0..strips {
-        let y0 = strip * ROWS_PER_STRIP;
-        let y1 = (y0 + ROWS_PER_STRIP).min(height);
-        if flavor.is_cfa() {
-            tiff::mosaic_rows(&img.planes, width, y0, y1, &mut raw);
-        } else {
-            tiff::interleave_rows(&img.planes, width, y0, y1, &mut raw);
+    if opts.compress {
+        // One strip, streamed: pass one collects the difference histogram,
+        // pass two writes the entropy data row by row.
+        let components = if flavor.is_cfa() { 1 } else { 3 };
+        let mut row = vec![0u16; width * components];
+        let mut encoder = ljpeg::StripEncoder::new(width, components);
+        for y in 0..height {
+            pack_row(&img.planes, width, y, flavor.is_cfa(), &mut row);
+            encoder.add_row(&row);
         }
-        offsets.push((strips_off + written) as u32);
-        if opts.compress {
-            packed.clear();
-            let mut encoder = ZlibEncoder::new(&mut packed, Compression::default());
-            encoder.write_all(&raw)?;
-            encoder.finish()?;
-            w.write_all(&packed)?;
-            counts.push(packed.len() as u32);
-            written += packed.len() as u64;
-        } else {
+        let bytes = encoder.write_to(&mut *w, |y, row| {
+            pack_row(&img.planes, width, y, flavor.is_cfa(), row)
+        })?;
+        offsets.push(strips_off as u32);
+        counts.push(bytes as u32);
+    } else {
+        for strip in 0..strips {
+            let y0 = strip * ROWS_PER_STRIP;
+            let y1 = (y0 + ROWS_PER_STRIP).min(height);
+            if flavor.is_cfa() {
+                tiff::mosaic_rows(&img.planes, width, y0, y1, &mut raw);
+            } else {
+                tiff::interleave_rows(&img.planes, width, y0, y1, &mut raw);
+            }
+            offsets.push((strips_off + written) as u32);
             w.write_all(&raw)?;
             counts.push(raw.len() as u32);
             written += raw.len() as u64;
@@ -273,6 +291,36 @@ fn write_inner<W: Write + Seek>(
     patch_u32_values(w, main_positions.get(&tiff::TAG_STRIP_OFFSETS), &offsets)?;
     patch_u32_values(w, main_positions.get(&tiff::TAG_STRIP_BYTE_COUNTS), &counts)?;
     Ok(())
+}
+
+/// Pack one row of the merged image into interleaved u16 samples: RGB triples
+/// for the colour flavours, the Bayer mosaic for the CFA flavour.
+fn pack_row(
+    planes: &[Vec<u16>; 3],
+    width: usize,
+    y: usize,
+    cfa: bool,
+    out: &mut [u16],
+) {
+    let base = y * width;
+    if cfa {
+        // RGGB: the CFA position decides which plane each sample comes from.
+        for x in 0..width {
+            let plane = match (x & 1, y & 1) {
+                (0, 0) => 0,
+                (1, 1) => 2,
+                _ => 1,
+            };
+            out[x] = planes[plane][base + x];
+        }
+    } else {
+        for x in 0..width {
+            let i = base + x;
+            out[x * 3] = planes[0][i];
+            out[x * 3 + 1] = planes[1][i];
+            out[x * 3 + 2] = planes[2][i];
+        }
+    }
 }
 
 fn patch_u32_values<W: Write + Seek>(w: &mut W, pos: Option<&u64>, values: &[u32]) -> Result<()> {
@@ -356,6 +404,7 @@ fn fill_main_ifd(
     opts: &WriteOpts,
     flavor: DngFlavor,
     strips: usize,
+    rows_per_strip: usize,
     exif_ifd_off: u32,
 ) {
     ifd.set_long(tiff::TAG_NEW_SUBFILE_TYPE, 0);
@@ -369,7 +418,7 @@ fn fill_main_ifd(
     ifd.set_short(
         tiff::TAG_COMPRESSION,
         if opts.compress {
-            tiff::COMPRESSION_DEFLATE
+            tiff::COMPRESSION_JPEG
         } else {
             tiff::COMPRESSION_NONE
         },
@@ -378,7 +427,7 @@ fn fill_main_ifd(
     ifd.set_short(tiff::TAG_ORIENTATION, meta.orientation.max(1));
     ifd.set_short(tiff::TAG_SAMPLES_PER_PIXEL, samples as u16);
     ifd.set(tiff::TAG_STRIP_OFFSETS, Value::Longs(vec![0; strips]));
-    ifd.set_long(tiff::TAG_ROWS_PER_STRIP, ROWS_PER_STRIP as u32);
+    ifd.set_long(tiff::TAG_ROWS_PER_STRIP, rows_per_strip as u32);
     ifd.set(tiff::TAG_STRIP_BYTE_COUNTS, Value::Longs(vec![0; strips]));
     ifd.set(tiff::TAG_SAMPLE_FORMAT, Value::Shorts(vec![1; samples]));
     if flavor.is_cfa() {

@@ -3,7 +3,7 @@
 //! opening a window, and prints the timings.
 
 use crate::app::model::{
-    lod_level, visible_rect, GuiState, LodLevel, Stage, ViewSource, MAX_PREVIEW_DIM,
+    lod_step, visible_rect, CropWant, GuiState, Stage, ViewSource, MAX_PREVIEW_DIM,
 };
 use crate::distort::Distortion;
 use crate::app::pipeline;
@@ -109,7 +109,7 @@ fn fit_from_synthetic_reference(out_dir: &Path) -> Result<Check> {
     let known = Distortion::new3(-0.04, 0.005, -0.001);
     let recorded = apply_lens(clean.clone(), known);
     let path = out_dir.join("fit-reference.tif");
-    crate::write::write_tiff16(&path, &clean, &DngMeta::default())?;
+    crate::write::write_tiff16(&path, &clean, &DngMeta::default(), false)?;
     let report = crate::fit::fit_from_reference(&recorded, &path)?;
     println!("  fit       {}", report.summary());
     let applied = known.k1 + known.k2 + known.k3;
@@ -177,7 +177,7 @@ fn drive(mode: Mode, inputs: &[PathBuf], out_dir: &Path) -> Result<Report> {
     // preview is magnified past 1:1. The fabricated demo frame is smaller than
     // the base preview, so the level decision is checked on a real frame size.
     let zoom = 1.0;
-    let lod_decision = lod_level(zoom, SELFTEST_VIEWPORT, (6048, 4032), MAX_PREVIEW_DIM);
+    let lod_decision = lod_step(zoom, SELFTEST_VIEWPORT, (6048, 4032), MAX_PREVIEW_DIM);
     let crop_rect = visible_rect(
         [dims.0 as f32 * 0.5, dims.1 as f32 * 0.5],
         SELFTEST_VIEWPORT,
@@ -186,14 +186,19 @@ fn drive(mode: Mode, inputs: &[PathBuf], out_dir: &Path) -> Result<Report> {
         0.25,
     )
     .unwrap_or((dims.0 / 4, dims.1 / 4, (dims.0 / 2).max(2), (dims.1 / 2).max(2)));
+    let crop_want = CropWant {
+        rect: crop_rect,
+        step: 1,
+    };
     worker.send(Command::View {
         source: ViewSource::Merged,
         rect: Some(crop_rect),
+        step: 1,
     });
     pump_until(&worker, &mut state, STEP_TIMEOUT, |state| {
-        state.crop_for(Some(crop_rect)).is_some()
+        state.crop_for(Some(crop_want)).is_some()
     })?;
-    let detail_crop = state.crop_for(Some(crop_rect)).cloned();
+    let detail_crop = state.crop_for(Some(crop_want)).cloned();
 
     // Lens correction step: a k1 change must rebuild the preview without
     // touching the UI thread; the export path uses the same coefficients.
@@ -285,7 +290,7 @@ fn drive(mode: Mode, inputs: &[PathBuf], out_dir: &Path) -> Result<Report> {
     ));
     checks.push(Check::new(
         "zoom: lod decision",
-        lod_decision == LodLevel::Detail,
+        lod_decision == Some(1),
         format!(
             "zoom {zoom:.2} of a 6048 x 4032 frame -> {lod_decision:?}, base preview {MAX_PREVIEW_DIM} px"
         ),
@@ -496,7 +501,7 @@ mod tests {
     fn preview_flatness_check_works_on_fabricated_data() {
         let frames = demo::frames();
         let result = demo::result(1, &frames);
-        let image = demo::encode(&result, None, 512, [1.244, 1.0, 2.010]);
+        let image = demo::encode(&result, None, 512, [1.244, 1.0, 2.010], 1);
         assert!(!is_flat(&image));
         let flat = PreviewImage {
             width: 4,

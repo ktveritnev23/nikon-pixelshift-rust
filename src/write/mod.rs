@@ -5,6 +5,7 @@
 mod color;
 pub mod dng;
 pub mod jpeg;
+pub mod ljpeg;
 pub mod tiff;
 pub mod tiff16;
 

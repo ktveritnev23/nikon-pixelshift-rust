@@ -445,7 +445,9 @@ impl Default for DngMeta {
 
 #[derive(Clone, Debug)]
 pub struct WriteOpts {
-    /// Deflate-compress the image data (DNG).
+    /// Compress the image data losslessly: the DNG writer stores lossless
+    /// JPEG (Compression = 7, the process NEFs themselves use), the TIFF
+    /// writer stores AdobeDeflate with the horizontal predictor.
     pub compress: bool,
     /// Longest side of the embedded preview / thumbnail (0 = none).
     pub preview_max: u32,
@@ -453,8 +455,8 @@ pub struct WriteOpts {
 
 impl Default for WriteOpts {
     fn default() -> Self {
-        // Uncompressed by default: LibRaw 0.22 cannot read 16-bit Deflate DNGs,
-        // so compressed DNGs would not be verifiable (and break some readers).
+        // Uncompressed by default: the exact lossless bytes of the merged
+        // data, no codec in the reading path.
         Self {
             compress: false,
             preview_max: 0,

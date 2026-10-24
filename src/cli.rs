@@ -2,7 +2,7 @@
 //!
 //! Required surface:
 //!   pixelshift merge <input...> [--out FILE|DIR] [--scale auto|1|2]
-//!                   [--format dng|tiff] [--compression none|deflate]
+//!                   [--format dng|tiff] [--compression none|lossless]
 //!                   [--also-1x] [--no-align] [--threads N] [--quiet]
 //!   pixelshift inspect <input...>
 //!   pixelshift gui [--selftest] [--demo] [--lang auto|en|ru]
@@ -110,6 +110,9 @@ impl FlavorArg {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum CompressionArg {
     None,
+    /// DNG: lossless JPEG (Compression = 7); TIFF: AdobeDeflate + predictor.
+    Lossless,
+    /// Compatibility alias of `lossless` from the pre-1.0 CLI.
     Deflate,
 }
 
@@ -117,7 +120,7 @@ impl CompressionArg {
     pub fn compression(self) -> Compression {
         match self {
             CompressionArg::None => Compression::None,
-            CompressionArg::Deflate => Compression::Deflate,
+            CompressionArg::Lossless | CompressionArg::Deflate => Compression::Lossless,
         }
     }
 }
@@ -160,8 +163,8 @@ pub struct MergeArgs {
     /// the resulting k1,k2,k3 are applied. Conflicts with --distort.
     #[arg(long, value_name = "PATH")]
     pub distort_fit: Option<PathBuf>,
-    /// Deflate compression. 16-bit linear DNG is always written uncompressed
-    /// because LibRaw cannot read deflated 16-bit strips.
+    /// Lossless compression: lossless JPEG inside the DNG, AdobeDeflate with
+    /// a horizontal predictor inside the TIFF.
     #[arg(long, value_enum, default_value_t = CompressionArg::None)]
     pub compression: CompressionArg,
     /// Compatibility alias for --compression none.

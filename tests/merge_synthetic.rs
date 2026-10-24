@@ -890,6 +890,48 @@ fn preview_and_crop_are_sane() {
 }
 
 #[test]
+fn preview_crop_at_reduces_by_block_means() {
+    let scene = Scene;
+    let (w, h) = (128usize, 128usize);
+    let positions = half_lattice();
+    let frames: Vec<RawFrame> = positions
+        .iter()
+        .enumerate()
+        .map(|(i, p)| render(&scene, w, h, *p, 0.0, 101 + i as u64))
+        .collect();
+    let shifts: Vec<Shift> = positions.iter().map(|p| Shift::new(p.0, p.1)).collect();
+    let res = merge::merge(&frames, &params(2, shifts)).expect("merge");
+    let wb = [1.0f32, 1.0, 1.0];
+
+    // step = 1 is the plain crop.
+    let plain = merge::preview_crop(&res, (8, 8, 64, 64), wb);
+    let at1 = merge::preview_crop_at(&res, (8, 8, 64, 64), 1, wb);
+    assert_eq!((plain.width, plain.height), (at1.width, at1.height));
+    assert_eq!(plain.rgb, at1.rgb);
+
+    // An aligned rect at step 2 halves both dimensions.
+    let at2 = merge::preview_crop_at(&res, (8, 8, 64, 64), 2, wb);
+    assert_eq!((at2.width, at2.height), (32, 32));
+
+    // An unaligned rect is expanded outward to whole blocks: (9, 10, 63, 61)
+    // at step 4 covers (8, 8) .. (72, 72), so the texture is 16 x 16.
+    let at4 = merge::preview_crop_at(&res, (9, 10, 63, 61), 4, wb);
+    assert_eq!((at4.width, at4.height), (16, 16));
+
+    // Block means on a gradient stay inside the parent crop's value range.
+    let parent = merge::preview_crop(&res, (8, 8, 64, 64), wb);
+    let (pmin, pmax) = parent
+        .rgb
+        .iter()
+        .fold((255u8, 0u8), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+    let (cmin, cmax) =
+        at2.rgb
+            .iter()
+            .fold((255u8, 0u8), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+    assert!(cmin >= pmin && cmax <= pmax, "({cmin}..{cmax}) in ({pmin}..{pmax})");
+}
+
+#[test]
 fn downsample_1x_averages_pairs() {
     let scene = Scene;
     let (w, h) = (128usize, 128usize);

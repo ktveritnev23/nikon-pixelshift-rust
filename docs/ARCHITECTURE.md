@@ -71,6 +71,22 @@ Layout (all DNG flavors): the main image is **IFD0** (`NewSubfileType = 0`), the
 previews are following IFDs via the next pointer: IFD1 = 8-bit RGB (`1024` px long
 side, `NewSubfileType = 1`), IFD2 = baseline JPEG (`1600` px long side,
 `Compression = 7`, `PhotometricInterpretation = 6`). No SubIFDs are written.
+
+Compression (`WriteOpts::compress`, CLI `--compression lossless`): the DNG main
+image is written as lossless JPEG (`Compression = 7`, SOF3, predictor 1, point
+transform 0) in ONE strip spanning the image; the entropy data is streamed to the
+file row by row after a first pass collects the difference histogram (peak memory
+stays at one row). The single strip is deliberate: LibRaw's
+`lossless_dng_load_raw` follows multi-strip lossless JPEG through a tile-offset
+walk that does not work for strip layouts, so a per-strip stream format would
+decode only the first strip. Differences are modular (mod 2^16, category 16 is
+the fixed -32768 sentinel without amplitude bits) and the first sample of every
+line after the first predicts from the first sample of the line above - both
+quirks of the Adobe/LibRaw readers, verified by bit-identical `dcraw_emu` decodes
+of compressed and uncompressed files (tests/writers.rs). The TIFF writer stores
+AdobeDeflate (`Compression = 8`) with the horizontal-differencing predictor
+(`Predictor = 2`): per component, each pixel keeps its difference to the same
+component of the previous pixel.
 Why: a preview in IFD0 next to the raw image in a SubIFD made macOS ImageIO
 (Preview/sips) treat the linear RGB data as a CFA mosaic and render coloured
 blocks; with the main image in IFD0 the same file renders cleanly.
@@ -139,17 +155,16 @@ longer add up on the 2x grid.
   only) + metadata + `SubIFDs` -> main image IFD with PhotometricInterpretation
   34892 (LinearRaw; PI 2 is rejected by LibRaw for the main image),
   SamplesPerPixel 3, BitsPerSample 16, PlanarConfiguration 1, SampleFormat 1,
-  Compression 1 (uncompressed: 16-bit Deflate is not readable by LibRaw, so it is
-  not the default; LZW/Deflate may be offered only after an empirical reader
-  check), strips of 16 rows, WhiteLevel = white - black, BlackLevel = 0,
+  Compression 1 by default, lossless JPEG (7) with `--compression lossless`
+  (one strip, streamed; LibRaw does not walk a multi-strip LJ layout), strips of
+  16 rows when uncompressed, WhiteLevel = white - black, BlackLevel = 0,
   DNGVersion 1.4.0.0, DNGBackwardVersion 1.1.0.0, UniqueCameraModel,
   ColorMatrix1 = LibRaw cam_xyz (XYZ D50 -> camera native), CalibrationIlluminant1
   = 21 (D65), AsShotNeutral = normalised (1/wb_r, 1/wb_g, 1/wb_b) with pixels
   stored WITHOUT white balance, DefaultCropOrigin/Size, ActiveArea,
   BaselineExposure, EXIF basics, Software.
   Size consequence: 12096x8064x3x2 B = 558 MiB per uncompressed DNG.
-- TIFF: baseline 16-bit RGB, little-endian, strips, no compression (the Deflate option for
-  TIFF is accepted by the CLI but not implemented in this release; it prints a note).
+- TIFF: baseline 16-bit RGB, little-endian, strips; optionally AdobeDeflate + Predictor 2.
 - Both writers must be able to stream row bands (peak memory well below 8 GB).
 
 ## CLI conventions

@@ -114,7 +114,7 @@ fn merge_parses_every_flag() {
         "--deconvolve",
         "0.75",
         "--compression",
-        "deflate",
+        "lossless",
         "--also-1x",
         "--no-align",
         "--threads",
@@ -135,14 +135,14 @@ fn merge_parses_every_flag() {
     assert_eq!(args.dng_flavor, FlavorArg::Cfa);
     assert!(args.tiff_linear);
     assert_eq!(args.deconvolve, Some(0.75));
-    assert_eq!(args.compression, CompressionArg::Deflate);
+    assert_eq!(args.compression, CompressionArg::Lossless);
     assert!(args.also_1x && args.no_align && args.quiet);
     assert_eq!(args.threads, Some(6));
 
     let options = args.options();
     assert_eq!(options.scale, ScaleMode::Two);
     assert_eq!(options.format, OutFormat::Tiff);
-    assert_eq!(options.compression, Compression::Deflate);
+    assert_eq!(options.compression, Compression::Lossless);
     assert_eq!(options.flavor, DngFlavor::Cfa);
     assert!(!options.tiff_render, "--tiff-linear disables the render");
     assert_eq!(options.deconvolve, 0.75);

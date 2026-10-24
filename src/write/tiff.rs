@@ -34,6 +34,7 @@ pub const TAG_YCBCR_SUB_SAMPLING: u16 = 530;
 pub const TAG_YCBCR_POSITIONING: u16 = 531;
 pub const TAG_X_RESOLUTION: u16 = 282;
 pub const TAG_Y_RESOLUTION: u16 = 283;
+pub const TAG_PREDICTOR: u16 = 317;
 pub const TAG_PLANAR_CONFIG: u16 = 284;
 pub const TAG_RESOLUTION_UNIT: u16 = 296;
 pub const TAG_SOFTWARE: u16 = 305;

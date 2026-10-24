@@ -71,13 +71,16 @@ def image(path, mode):
         arr = np.zeros((1, 1, spp), dtype=np.uint8)
         return {'width': w, 'height': h, 'samples': spp, 'bits': bps[0],
                 'photometric': tags[262][2][0], 'new_subfile_type': tags[254][2][0],
-                'compression': comp, 'rows_per_strip': rps,
+                'compression': comp, 'rows_per_strip': rps, 'predictor': 1,
                 'strips': len(offsets), 'next_ifd': nxt,
                 'sub_ifds': tags[330][2] if 330 in tags else None,
                 'cfa_repeat': None, 'cfa_pattern': None, 'cfa_plane_color': None,
-                'cfa_layout': None, 'black_level_count': None,
-                'white_level_count': None, 'ifd_offset': off,
+                'cfa_layout': None,
+                'black_level_count': tags[50714][1] if 50714 in tags else None,
+                'white_level_count': tags[50717][1] if 50717 in tags else None,
+                'ifd_offset': off,
                 'bytes': len(data)}, arr
+    pred = tags[317][2][0] if 317 in tags else 1
     chunks = []
     for o, c in zip(offsets, counts):
         blob = data[o:o + c]
@@ -89,9 +92,13 @@ def image(path, mode):
     raw = b''.join(chunks)
     dtype = '<u2' if bps[0] == 16 else np.uint8
     arr = np.frombuffer(raw, dtype=dtype)[: w * h * spp].reshape(h, w, spp)
+    if pred == 2:
+        # Undo the horizontal differencing with 16 bit wraparound.
+        acc = np.cumsum(arr.astype(np.int64), axis=1)
+        arr = (acc & 0xFFFF).astype(arr.dtype) if bps[0] == 16 else (acc & 0xFF).astype(arr.dtype)
     return {'width': w, 'height': h, 'samples': spp, 'bits': bps[0],
             'photometric': tags[262][2][0], 'new_subfile_type': tags[254][2][0],
-            'compression': comp, 'rows_per_strip': rps,
+            'compression': comp, 'rows_per_strip': rps, 'predictor': pred,
             'strips': len(offsets), 'next_ifd': nxt,
             'sub_ifds': tags[330][2] if 330 in tags else None,
             'cfa_repeat': tags[33421][2] if 33421 in tags else None,
@@ -325,6 +332,12 @@ fn compare_mosaic_exactly(img: &MergeResult, json: &serde_json::Value) {
 
 /// IFD0 must carry the full resolution image and IFD1 the 8-bit preview.
 fn assert_layout(path: &Path, flavor: DngFlavor, main_samples: u64) {
+    assert_layout_rows(path, flavor, main_samples, 16);
+}
+
+/// `assert_layout` with an explicit RowsPerStrip (lossless JPEG is written as
+/// one strip spanning the image).
+fn assert_layout_rows(path: &Path, flavor: DngFlavor, main_samples: u64, rows: u64) {
     let main = python_json_mode(path, None);
     let info = &main["info"];
     assert_eq!(info["width"].as_u64(), Some(WIDTH as u64));
@@ -337,7 +350,7 @@ fn assert_layout(path: &Path, flavor: DngFlavor, main_samples: u64) {
         "IFD0 photometric"
     );
     assert_eq!(info["new_subfile_type"].as_u64(), Some(0));
-    assert_eq!(info["rows_per_strip"].as_u64(), Some(16));
+    assert_eq!(info["rows_per_strip"].as_u64(), Some(rows));
     assert_eq!(
         info["black_level_count"].as_u64(),
         Some(main_samples),
@@ -350,7 +363,7 @@ fn assert_layout(path: &Path, flavor: DngFlavor, main_samples: u64) {
     );
     assert_eq!(
         info["strips"].as_u64(),
-        Some((HEIGHT as u64).div_ceil(16)),
+        Some((HEIGHT as u64).div_ceil(rows)),
         "strip count"
     );
     assert!(
@@ -709,7 +722,7 @@ fn imageio_reads_the_cfa_flavor() {
 fn imageio_reads_the_rendered_tiff() {
     let img = synthetic();
     let path = out_dir().join("wp1_rendered_sips.tiff");
-    write_tiff16_rendered(&path, &img, &meta()).expect("write tiff");
+    write_tiff16_rendered(&path, &img, &meta(), false).expect("write tiff");
     let (ok, size) = tool(
         "sips",
         &[
@@ -1117,37 +1130,82 @@ fn writes_dng_with_real_camera_metadata() {
 }
 
 #[test]
-fn dng_deflate_strips_are_valid_zlib() {
+fn dng_lossless_jpeg_decodes_identically_in_libraw() {
     let img = synthetic();
-    let path = out_dir().join("wp1_deflate.dng");
-    let opts = WriteOpts {
+    let plain = out_dir().join("wp1_lj_plain.dng");
+    let packed = out_dir().join("wp1_lj.dng");
+    write_dng(&plain, &img, &meta(), &opts()).expect("write plain dng");
+    let compressed = WriteOpts {
         compress: true,
-        preview_max: 200,
+        preview_max: PREVIEW,
     };
-    write_dng(&path, &img, &meta(), &opts).expect("write compressed dng");
+    write_dng(&packed, &img, &meta(), &compressed).expect("write ljpeg dng");
 
-    let (ok, tiffinfo) = tool("tiffinfo", &["-d", path.to_str().unwrap()]);
-    assert!(ok, "tiffinfo failed:\n{tiffinfo}");
+    // Structure: the main image carries Compression = 7, the layout is
+    // otherwise the plain one.
+    let json = python_json_mode(&packed, None);
+    assert_eq!(json["info"]["compression"].as_u64(), Some(7));
+    assert_layout_rows(&packed, DngFlavor::LinearRaw, 3, HEIGHT as u64);
+
+    // libtiff's JPEG codec only decodes DCT-based 8/12 bit streams, so its
+    // pixel dump rejects 16 bit lossless JPEG ("Improper JPEG data
+    // precision"); the structure dump still works and LibRaw below is the
+    // reader that matters.
+    let (_, tiffinfo) = tool("tiffinfo", &[packed.to_str().unwrap()]);
     assert!(
-        tiffinfo.contains("Compression Scheme: AdobeDeflate"),
-        "deflate flag not honoured:\n{tiffinfo}"
+        tiffinfo.contains("Compression Scheme: JPEG"),
+        "lossless JPEG flag not honoured:\n{tiffinfo}"
     );
-    assert!(tiffinfo.contains("Rows/Strip: 16"));
+    assert!(
+        tiffinfo.contains(&format!("Rows/Strip: {HEIGHT}")),
+        "lossless JPEG must be one strip:\n{tiffinfo}"
+    );
+    assert!(!tiffinfo.contains("SubIFD"), "SubIFD must not be used:\n{tiffinfo}");
 
-    // The python reader inflates the strips with zlib and must get the exact
-    // merged samples back from the main image in IFD0.
-    let json = python_json_mode(&path, None);
-    assert_eq!(json["info"]["compression"].as_u64(), Some(8));
-    assert_eq!(
-        json["info"]["strips"].as_u64(),
-        Some((HEIGHT as u64).div_ceil(16))
-    );
-    compare_planes_exactly(&img, &json);
+    let plain_bytes = std::fs::metadata(&plain).unwrap().len();
+    let lj_bytes = std::fs::metadata(&packed).unwrap().len();
     eprintln!(
-        "deflate dng: {} bytes for {} raw bytes",
-        std::fs::metadata(&path).unwrap().len(),
-        WIDTH * HEIGHT * 6
+        "lossless JPEG dng: {lj_bytes} bytes vs {plain_bytes} uncompressed ({:.0} %)",
+        lj_bytes as f64 / plain_bytes as f64 * 100.0
     );
+    assert!(lj_bytes < plain_bytes, "compression did not shrink the file");
+    // On smooth synthetic gradients the codec must come well below half.
+    assert!(
+        (lj_bytes as f64 / plain_bytes as f64) < 0.6,
+        "lossless JPEG is not compressing: {lj_bytes} vs {plain_bytes}"
+    );
+
+    // The decisive check: LibRaw decodes both files and the decoded pixels
+    // must be bit identical - an independent decoder certifies the codec.
+    for file in [&plain, &packed] {
+        let (ok, decode) = tool(
+            "dcraw_emu",
+            &["-T", "-4", "-o", "0", "-w", file.to_str().unwrap()],
+        );
+        assert!(ok, "dcraw_emu failed on {}:\n{decode}", file.display());
+        assert!(!decode.contains("Cannot"), "dcraw_emu error:\n{decode}");
+    }
+    let decoded_plain = std::fs::read(format!("{}.tiff", plain.display()))
+        .expect("decoded plain tiff");
+    let decoded_lj = std::fs::read(format!("{}.tiff", packed.display()))
+        .expect("decoded ljpeg tiff");
+    assert_eq!(
+        decoded_plain, decoded_lj,
+        "LibRaw decode differs between uncompressed and lossless JPEG"
+    );
+
+    // raw-identify, ImageMagick and ImageIO also parse the compressed file.
+    let (ok, identify) = tool("raw-identify", &["-v", packed.to_str().unwrap()]);
+    assert!(ok, "raw-identify failed:\n{identify}");
+    assert!(identify.contains("Raw colors: 3"), "no RGB raw:\n{identify}");
+    let (ok, magick) = tool("magick", &["identify", packed.to_str().unwrap()]);
+    assert!(ok, "ImageMagick failed:\n{magick}");
+    assert!(magick.contains("512x384"), "ImageMagick geometry:\n{magick}");
+    if cfg!(target_os = "macos") {
+        let (ok, sips) = tool("sips", &["-g", "pixelWidth", packed.to_str().unwrap()]);
+        assert!(ok, "sips failed:\n{sips}");
+        assert!(sips.contains("512"), "sips geometry:\n{sips}");
+    }
 }
 
 /// Not part of the default suite: writes a full 96 MP DNG (12096x8064) to show
@@ -1212,7 +1270,7 @@ fn writes_96mp_dng_by_streaming_strips() {
 fn writes_tiff16_that_python_and_imagemagick_read() {
     let img = synthetic();
     let path = out_dir().join("wp1_linear.tiff");
-    write_tiff16(&path, &img, &meta()).expect("write tiff");
+    write_tiff16(&path, &img, &meta(), false).expect("write tiff");
 
     let (ok, tiffinfo) = tool("tiffinfo", &[path.to_str().unwrap()]);
     assert!(ok, "tiffinfo failed:\n{tiffinfo}");
@@ -1265,10 +1323,59 @@ fn writes_tiff16_that_python_and_imagemagick_read() {
 }
 
 #[test]
+fn tiff16_deflate_with_predictor_round_trips() {
+    let img = synthetic();
+    let path = out_dir().join("wp1_deflate.tiff");
+    write_tiff16(&path, &img, &meta(), true).expect("write compressed tiff");
+
+    let (ok, tiffinfo) = tool("tiffinfo", &[path.to_str().unwrap()]);
+    assert!(ok, "tiffinfo failed:\n{tiffinfo}");
+    assert!(
+        tiffinfo.contains("Compression Scheme: AdobeDeflate"),
+        "deflate flag not honoured:\n{tiffinfo}"
+    );
+    assert!(
+        tiffinfo.contains("Predictor: horizontal differencing 2"),
+        "predictor tag not honoured:\n{tiffinfo}"
+    );
+
+    // The python reader inflates the strips, undoes the predictor and must
+    // get the exact merged samples back.
+    let json = python_json(&path);
+    assert_eq!(json["info"]["compression"].as_u64(), Some(8));
+    assert_eq!(json["info"]["predictor"].as_u64(), Some(2));
+    compare_planes_exactly(&img, &json);
+
+    let plain = out_dir().join("wp1_linear.tiff");
+    if plain.exists() {
+        let plain_bytes = std::fs::metadata(&plain).unwrap().len();
+        let deflate_bytes = std::fs::metadata(&path).unwrap().len();
+        eprintln!(
+            "deflate tiff: {deflate_bytes} bytes vs {plain_bytes} uncompressed ({:.0} %)",
+            deflate_bytes as f64 / plain_bytes as f64 * 100.0
+        );
+        assert!(deflate_bytes < plain_bytes, "deflate did not shrink the file");
+    }
+
+    // Pillow understands AdobeDeflate with a predictor.
+    let (ok, pil) = tool(
+        "python3",
+        &[
+            "-c",
+            "from PIL import Image; import sys; im = Image.open(sys.argv[1]); \
+             print(im.size, im.mode)",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "Pillow failed:\n{pil}");
+    assert!(pil.contains("(512, 384)"), "Pillow geometry: {pil}");
+}
+
+#[test]
 fn rendered_tiff_looks_like_a_normal_srgb_picture() {
     let img = synthetic();
     let path = out_dir().join("wp1_rendered.tiff");
-    write_tiff16_rendered(&path, &img, &meta()).expect("write rendered tiff");
+    write_tiff16_rendered(&path, &img, &meta(), false).expect("write rendered tiff");
 
     let (ok, tiffinfo) = tool("tiffinfo", &[path.to_str().unwrap()]);
     assert!(ok, "tiffinfo failed:\n{tiffinfo}");

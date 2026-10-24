@@ -93,57 +93,41 @@ impl UiPrefs {
         ctx.set_fonts(definitions);
     }
 
-    /// Compact widget for the top bar; true when one of the values changed.
-    pub fn settings_ui(&mut self, ui: &mut egui::Ui) -> bool {
+    /// Settings rows shown on the settings tab of the left panel; true when
+    /// one of the values changed.
+    pub fn settings_body(&mut self, ui: &mut egui::Ui) -> bool {
         let lang = self.lang;
         let mut changed = false;
-        ui.menu_button(lang.t("Settings", "Настройки"), |ui| {
-            ui.horizontal(|ui| {
-                ui.label(lang.t("Language", "Язык"));
-                changed |= ui
-                    .selectable_value(&mut self.lang, Lang::En, "English")
-                    .changed();
-                changed |= ui
-                    .selectable_value(&mut self.lang, Lang::Ru, "Русский")
-                    .changed();
-            });
-            ui.horizontal(|ui| {
-                ui.label(lang.t("Theme", "Тема"));
-                changed |= ui
-                    .selectable_value(
-                        &mut self.theme,
-                        ThemeMode::System,
-                        lang.t("System", "Системная"),
-                    )
-                    .changed();
-                changed |= ui
-                    .selectable_value(&mut self.theme, ThemeMode::Dark, lang.t("Dark", "Тёмная"))
-                    .changed();
-                changed |= ui
-                    .selectable_value(
-                        &mut self.theme,
-                        ThemeMode::Light,
-                        lang.t("Light", "Светлая"),
-                    )
-                    .changed();
-            });
-            ui.horizontal(|ui| {
-                ui.label(lang.t("Font", "Шрифт"));
-                changed |= ui
-                    .selectable_value(
-                        &mut self.font,
-                        FontMode::System,
-                        lang.t("System", "Системный"),
-                    )
-                    .changed();
-                changed |= ui
-                    .selectable_value(
-                        &mut self.font,
-                        FontMode::Builtin,
-                        lang.t("Built-in", "Встроенный"),
-                    )
-                    .changed();
-            });
+        ui.heading(lang.t("Settings", "Настройки"));
+        ui.horizontal(|ui| {
+            ui.label(lang.t("Language", "Язык"));
+            changed |= ui
+                .selectable_value(&mut self.lang, Lang::En, "English")
+                .changed();
+            changed |= ui
+                .selectable_value(&mut self.lang, Lang::Ru, "Русский")
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label(lang.t("Theme", "Тема"));
+            changed |= ui
+                .selectable_value(&mut self.theme, ThemeMode::System, lang.t("System", "Системная"))
+                .changed();
+            changed |= ui
+                .selectable_value(&mut self.theme, ThemeMode::Dark, lang.t("Dark", "Тёмная"))
+                .changed();
+            changed |= ui
+                .selectable_value(&mut self.theme, ThemeMode::Light, lang.t("Light", "Светлая"))
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label(lang.t("Font", "Шрифт"));
+            changed |= ui
+                .selectable_value(&mut self.font, FontMode::System, lang.t("System", "Системный"))
+                .changed();
+            changed |= ui
+                .selectable_value(&mut self.font, FontMode::Builtin, lang.t("Built-in", "Встроенный"))
+                .changed();
         });
         changed
     }

@@ -46,6 +46,25 @@
 | Capture One Pro | не проверено локально | вероятно ✓ (обычный Bayer-DNG) | не проверено | ✓ (TIFF импортируется всегда) |
 | Lightroom / ACR | не проверено локально (DNG LinearRaw — штатный формат Adobe) | ожидается ✓ | — | ✓ |
 
+## Сжатие без потерь
+
+`--compression lossless` (GUI: параметр «сжатие») меняет способ хранения пикселей:
+DNG — lossless JPEG (Compression = 7, тот же процесс, что в самих NEF; одна полоса
+на всё изображение), TIFF — AdobeDeflate (Compression = 8) с горизонтальным
+предиктором (Predictor = 2). На гладких сценах файл уменьшается до ~30 %, на шумных —
+примерно вдвое.
+
+| Читатель | DNG lossless JPEG | TIFF Deflate+predictor |
+|---|---|---|
+| LibRaw (`raw-identify`, `dcraw_emu`) | ✓ декод побитово совпадает с несжатым файлом (тест writers) | — (не raw) |
+| ImageMagick | ✓ | ✓ |
+| ImageIO / Preview (`sips`) | ✓ | не проверено |
+| rawler 0.6 (RapidRAW) | не проверено | — |
+| tiffinfo (libtiff) | структура ✓; пиксели — нет: JPEG-кодек libtiff не поддерживает 16-битный lossless-процесс | ✓ |
+
+Практический смысл: сжатый DNG проходит весь приёмочный контур (`tools/validate.py`
+использует `dcraw_emu`), то есть сжатие больше не жертвует проверяемостью.
+
 ## Линзовые метаданные
 
 Во все флейворы пишутся `LensModel` (0xA434), `LensSpecification` (0xA432),

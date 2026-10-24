@@ -2,8 +2,9 @@
 
 use crate::app::i18n::Lang;
 use crate::app::model::{
-    clamp_center, fit_zoom, lod_level, visible_rect, Compression, GuiState, LodLevel, OutFormat,
-    PreviewSlot, Request, ScaleMode, Stage, ViewSource, MAX_PREVIEW_DIM, MAX_ZOOM, MIN_ZOOM,
+    clamp_center, fit_zoom, lod_step, visible_rect, Compression, CropWant, GuiState, LeftTab,
+    OutFormat, PreviewSlot, Request, ScaleMode, Stage, ViewSource, MAX_PREVIEW_DIM, MAX_ZOOM,
+    MIN_ZOOM,
 };
 use crate::app::pipeline::{self, ResultInfo};
 use crate::app::prefs::UiPrefs;
@@ -12,25 +13,47 @@ use crate::write::DngFlavor;
 use eframe::egui;
 use egui::{Color32, Rect, Sense, Vec2};
 
-/// Texture cache for the preview images the worker sends back.
-#[derive(Default)]
+/// Texture cache for the preview images the worker sends back. One handle per
+/// preview generation, so the base image and the current crop can be on
+/// screen at the same time; handles beyond the cap are dropped oldest first
+/// (egui frees the GPU texture when the last handle goes away).
 pub struct PreviewCache {
-    handle: Option<egui::TextureHandle>,
-    key: u64,
-    size: (usize, usize),
+    textures: Vec<(u64, egui::TextureHandle)>,
+}
+
+impl Default for PreviewCache {
+    fn default() -> Self {
+        Self {
+            textures: Vec::new(),
+        }
+    }
 }
 
 impl PreviewCache {
+    const MAX_TEXTURES: usize = 8;
+
     fn texture(&mut self, ctx: &egui::Context, slot: &PreviewSlot) -> &egui::TextureHandle {
-        if self.key != slot.generation || self.handle.is_none() {
-            let image =
-                egui::ColorImage::from_rgb([slot.image.width, slot.image.height], &slot.image.rgb);
-            self.handle =
-                Some(ctx.load_texture("pixelshift-preview", image, egui::TextureOptions::LINEAR));
-            self.key = slot.generation;
-            self.size = (slot.image.width, slot.image.height);
+        if let Some(pos) = self
+            .textures
+            .iter()
+            .position(|(key, _)| *key == slot.generation)
+        {
+            return &self.textures[pos].1;
         }
-        self.handle.as_ref().expect("preview texture")
+        let image =
+            egui::ColorImage::from_rgb([slot.image.width, slot.image.height], &slot.image.rgb);
+        let handle = ctx.load_texture(
+            format!("pixelshift-preview-{}", slot.generation),
+            image,
+            egui::TextureOptions::LINEAR,
+        );
+        self.textures.push((slot.generation, handle));
+        while self.textures.len() > Self::MAX_TEXTURES {
+            // Dropping the handle frees the GPU texture.
+            drop(self.textures.remove(0));
+        }
+        let last = self.textures.len() - 1;
+        &self.textures[last].1
     }
 }
 
@@ -50,15 +73,17 @@ pub fn draw(
             distort: state.options.distort,
         });
     }
+    let lang = prefs.lang;
     let mut changed = false;
     let _ = egui::Panel::top("pixelshift-top").show(ui, |ui| {
-        changed |= top_bar(state, prefs, ui);
+        top_bar(state, lang, ui);
     });
-    let lang = prefs.lang;
     let _ = egui::Panel::left("pixelshift-left")
         .resizable(true)
         .default_size(370.0)
-        .show(ui, |ui| left_panel(state, lang, ui));
+        .show(ui, |ui| {
+            changed |= left_panel(state, prefs, lang, ui);
+        });
     let _ = egui::Panel::bottom("pixelshift-bottom")
         .resizable(true)
         .default_size(150.0)
@@ -67,9 +92,7 @@ pub fn draw(
     changed
 }
 
-fn top_bar(state: &mut GuiState, prefs: &mut UiPrefs, ui: &mut egui::Ui) -> bool {
-    let lang = prefs.lang;
-    let mut prefs_changed = false;
+fn top_bar(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         if ui
             .button(lang.t("Open folder...", "Открыть папку..."))
@@ -152,10 +175,8 @@ fn top_bar(state: &mut GuiState, prefs: &mut UiPrefs, ui: &mut egui::Ui) -> bool
             }
             ui.checkbox(&mut state.show_log, lang.t("log", "лог"));
             ui.label(egui::RichText::new(crate::version()).weak());
-            prefs_changed |= prefs.settings_ui(ui);
         });
     });
-    prefs_changed
 }
 
 /// Warning colour that follows the active theme: the bright warning colour in
@@ -173,69 +194,90 @@ fn demo_warning_color(ui: &egui::Ui) -> Color32 {
     }
 }
 
-fn left_panel(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
+/// Left panel with three tabs: the series list and frame table, the merge
+/// parameters, and the application settings. Returns true when a preference
+/// changed and must be re-applied.
+fn left_panel(state: &mut GuiState, prefs: &mut UiPrefs, lang: Lang, ui: &mut egui::Ui) -> bool {
+    let mut prefs_changed = false;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.heading(lang.t("Series", "Серии"));
-            if state.mode == Mode::Demo {
-                ui.label(
-                    egui::RichText::new("demo data: fabricated frames")
-                        .color(demo_warning_color(ui)),
-                );
-            }
-            let mut select = None;
-            for (index, series) in state.series.iter().enumerate() {
-                let status = if series.loaded {
-                    lang.t("merged", "объединено")
-                } else {
-                    lang.t("idle", "ожидает")
-                };
-                let text = format!("{}  [{status}]", series.info.label());
-                if ui.selectable_label(index == state.selected, text).clicked() {
-                    select = Some(index);
-                }
-            }
-            if state.series.is_empty() {
-                ui.label(lang.t("no series loaded", "серии не загружены"));
-            }
-            if let Some(index) = select {
-                state.selected = index;
-                state.selected_frame = 0;
-                state.fit_view();
-                state.requests.push(Request::View {
-                    source: state.view.source,
-                    rect: None,
-                });
-            }
-            let queued = state.queue.len();
             ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        !state.series.is_empty(),
-                        egui::Button::new(lang.t("queue all", "в очередь все")),
-                    )
-                    .clicked()
-                {
-                    state.queue = (0..state.series.len()).collect();
-                }
-                if ui
-                    .add_enabled(
-                        queued > 0,
-                        egui::Button::new(lang.t("clear queue", "очистить очередь")),
-                    )
-                    .clicked()
-                {
-                    state.queue.clear();
-                }
-                ui.label(format!("{queued} {}", lang.t("queued", "в очереди")));
+                ui.selectable_value(&mut state.left_tab, LeftTab::Series, lang.t("Series", "Серии"));
+                ui.selectable_value(&mut state.left_tab, LeftTab::Params, lang.t("Params", "Параметры"));
+                ui.selectable_value(
+                    &mut state.left_tab,
+                    LeftTab::Settings,
+                    lang.t("Settings", "Настройки"),
+                );
             });
-
             ui.separator();
-            frames_panel(state, lang, ui);
-            ui.separator();
-            options_panel(state, lang, ui);
+            match state.left_tab {
+                LeftTab::Series => series_tab(state, lang, ui),
+                LeftTab::Params => options_panel(state, lang, ui),
+                LeftTab::Settings => prefs_changed |= prefs.settings_body(ui),
+            }
         });
+    prefs_changed
+}
+
+fn series_tab(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
+    if state.mode == Mode::Demo {
+        ui.label(
+            egui::RichText::new("demo data: fabricated frames")
+                .color(demo_warning_color(ui)),
+        );
+    }
+    let mut select = None;
+    for (index, series) in state.series.iter().enumerate() {
+        let status = if series.loaded {
+            lang.t("merged", "объединено")
+        } else {
+            lang.t("idle", "ожидает")
+        };
+        let text = format!("{}  [{status}]", series.info.label());
+        if ui.selectable_label(index == state.selected, text).clicked() {
+            select = Some(index);
+        }
+    }
+    if state.series.is_empty() {
+        ui.label(lang.t("no series loaded", "серии не загружены"));
+    }
+    if let Some(index) = select {
+        state.selected = index;
+        state.selected_frame = 0;
+        state.fit_view();
+        state.requests.push(Request::View {
+            source: state.view.source,
+            rect: None,
+            step: 1,
+        });
+    }
+    let queued = state.queue.len();
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                !state.series.is_empty(),
+                egui::Button::new(lang.t("queue all", "в очередь все")),
+            )
+            .clicked()
+        {
+            state.queue = (0..state.series.len()).collect();
+        }
+        if ui
+            .add_enabled(
+                queued > 0,
+                egui::Button::new(lang.t("clear queue", "очистить очередь")),
+            )
+            .clicked()
+        {
+            state.queue.clear();
+        }
+        ui.label(format!("{queued} {}", lang.t("queued", "в очереди")));
+    });
+
+    ui.separator();
+    frames_panel(state, lang, ui);
 }
 
 fn frames_panel(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
@@ -306,7 +348,6 @@ fn frames_panel(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
 }
 
 fn options_panel(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
-    ui.heading(lang.t("Options", "Параметры"));
     ui.horizontal(|ui| {
         ui.label(lang.t("scale", "масштаб"));
         egui::ComboBox::from_id_salt("pixelshift-scale")
@@ -594,7 +635,7 @@ fn flavor_label(lang: Lang, flavor: DngFlavor) -> &'static str {
 fn compression_label(lang: Lang, compression: Compression) -> &'static str {
     match compression {
         Compression::None => lang.t("none", "без сжатия"),
-        Compression::Deflate => "deflate",
+        Compression::Lossless => lang.t("lossless", "без потерь"),
     }
 }
 
@@ -621,12 +662,12 @@ fn source_label(lang: Lang, source: ViewSource) -> &'static str {
 fn output_size_line(state: &GuiState, lang: Lang, estimate: &ResultInfo) -> String {
     let uncompressed = pipeline::fmt_bytes(estimate.bytes());
     match (state.options.format, state.options.compression) {
-        (OutFormat::Tiff, Compression::Deflate) => format!(
+        (_, Compression::Lossless) => format!(
             "{} {}",
             uncompressed,
             lang.t(
-                "uncompressed 16-bit; deflate expected ~1.5-2x smaller",
-                "без сжатия, 16-bit; deflate обычно даёт файл в ~1.5-2 раза меньше",
+                "uncompressed estimate; lossless is typically ~2x smaller",
+                "оценка без сжатия; lossless обычно даёт файл вдвое меньше",
             )
         ),
         _ => format!(
@@ -735,9 +776,11 @@ fn canvas(state: &mut GuiState, cache: &mut PreviewCache, lang: Lang, ui: &mut e
             state.requests.push(Request::View {
                 source: state.view.source,
                 rect: None,
+                step: 1,
             });
         }
         ui.checkbox(&mut state.view.crop, lang.t("1:1 crop", "кроп 1:1"));
+        ui.checkbox(&mut state.view.grid, lang.t("grid", "сетка"));
         if ui.button(lang.t("fit", "вписать")).clicked() {
             state.view.fitted = true;
         }
@@ -789,17 +832,21 @@ fn canvas(state: &mut GuiState, cache: &mut PreviewCache, lang: Lang, ui: &mut e
     }
     state.view.center = clamp_center(state.view.center, state.view.zoom, viewport, dims);
 
-    // Level of detail: the fitted preview until it is magnified past 1:1, a 1:1
-    // crop of the merged image afterwards (the "1:1 crop" box forces it).
-    let level = if state.view.crop && state.view.zoom >= 1.0 {
-        LodLevel::Detail
+    // Level of detail: the fitted preview until it is magnified past its own
+    // resolution, then a crop at the pyramid step that fits the visible window
+    // into one viewport-sized texture (the "1:1 crop" box forces full
+    // resolution samples).
+    let step = if state.view.crop && state.view.zoom >= 1.0 {
+        Some(1u32)
     } else {
-        lod_level(state.view.zoom, viewport, dims, MAX_PREVIEW_DIM)
+        state
+            .sample_grid()
+            .and_then(|grid| lod_step(state.view.zoom, viewport, grid, MAX_PREVIEW_DIM))
     };
-    let wanted = match level {
-        LodLevel::Detail => visible_rect(state.view.center, viewport, state.view.zoom, dims, 0.25),
-        LodLevel::Base => None,
-    };
+    let wanted = step.and_then(|step| {
+        visible_rect(state.view.center, viewport, state.view.zoom, dims, 0.25)
+            .map(|rect| CropWant { rect, step })
+    });
     let loading = state.poll_lod(wanted, std::time::Instant::now());
 
     let zoom = state.view.zoom;
@@ -822,6 +869,25 @@ fn canvas(state: &mut GuiState, cache: &mut PreviewCache, lang: Lang, ui: &mut e
         let crop_rect = slot.rect.unwrap_or((0, 0, dims.0, dims.1));
         paint_slot(&painter, texture.id(), crop_rect, center, zoom, rect, true);
     }
+    // Straight grid for manual lens alignment: pinned to the image, shown
+    // while a distortion slider is being dragged even when toggled off.
+    if state.view.grid || state.distortion_being_edited() {
+        draw_grid(&painter, rect, center, zoom, dims, ui.visuals().dark_mode);
+    }
+    // Drag-and-drop feedback: files hovering over the window promise to load.
+    if ui.ctx().input(|i| !i.raw.hovered_files.is_empty()) {
+        painter.rect_filled(rect, 4.0, Color32::from_black_alpha(150));
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            lang.t(
+                "drop a folder or raw files to open",
+                "отпустите папку или raw-файлы, чтобы открыть",
+            ),
+            egui::FontId::proportional(18.0),
+            Color32::WHITE,
+        );
+    }
     if loading {
         painter.text(
             rect.right_top() + Vec2::new(-8.0, 8.0),
@@ -843,9 +909,10 @@ fn canvas(state: &mut GuiState, cache: &mut PreviewCache, lang: Lang, ui: &mut e
         } else {
             ""
         },
-        match level {
-            LodLevel::Base => lang.t("base", "база"),
-            LodLevel::Detail => lang.t("detail 1:1", "детали 1:1"),
+        match step {
+            None => lang.t("base", "база").to_owned(),
+            Some(1) => lang.t("detail 1:1", "детали 1:1").to_owned(),
+            Some(s) => format!("{} 1/{s}", lang.t("detail", "детали")),
         }
     );
     painter.text(
@@ -855,6 +922,72 @@ fn canvas(state: &mut GuiState, cache: &mut PreviewCache, lang: Lang, ui: &mut e
         egui::FontId::monospace(12.0),
         Color32::from_rgb(180, 180, 190),
     );
+}
+
+/// Straight-line grid over the image extent, for manual distortion
+/// alignment: scene lines that should be straight are bent against it. The
+/// cell size is a power of two in image pixels, chosen so one cell spans
+/// 80..160 screen pixels, and only lines inside the visible canvas are
+/// emitted.
+fn draw_grid(
+    painter: &egui::Painter,
+    canvas: Rect,
+    center: [f32; 2],
+    zoom: f32,
+    dims: (usize, usize),
+    dark: bool,
+) {
+    if zoom <= 0.0 || dims.0 == 0 || dims.1 == 0 {
+        return;
+    }
+    let to_screen = |x: f32, y: f32| -> egui::Pos2 {
+        canvas.center() + Vec2::new((x - center[0]) * zoom, (y - center[1]) * zoom)
+    };
+    let (weak, strong) = if dark {
+        (
+            Color32::from_white_alpha(60),
+            Color32::from_white_alpha(110),
+        )
+    } else {
+        (
+            Color32::from_black_alpha(45),
+            Color32::from_black_alpha(80),
+        )
+    };
+    let mut step = 1.0f32;
+    while step * zoom < 80.0 {
+        step *= 2.0;
+    }
+    // Visible image range: the canvas window intersected with the image.
+    let top_left = canvas.center() + Vec2::new(-center[0] * zoom, -center[1] * zoom);
+    let x_start = ((canvas.left() - top_left.x) / zoom).floor().clamp(0.0, dims.0 as f32);
+    let x_end = ((canvas.right() - top_left.x) / zoom)
+        .ceil()
+        .clamp(0.0, dims.0 as f32);
+    let y_start = ((canvas.top() - top_left.y) / zoom).floor().clamp(0.0, dims.1 as f32);
+    let y_end = ((canvas.bottom() - top_left.y) / zoom)
+        .ceil()
+        .clamp(0.0, dims.1 as f32);
+    let center_x = dims.0 as f32 * 0.5;
+    let center_y = dims.1 as f32 * 0.5;
+    let mut x = (x_start / step).ceil() * step;
+    while x <= x_end {
+        let color = if (x - center_x).abs() < step * 0.25 { strong } else { weak };
+        painter.line_segment(
+            [to_screen(x, y_start), to_screen(x, y_end)],
+            egui::Stroke::new(1.0, color),
+        );
+        x += step;
+    }
+    let mut y = (y_start / step).ceil() * step;
+    while y <= y_end {
+        let color = if (y - center_y).abs() < step * 0.25 { strong } else { weak };
+        painter.line_segment(
+            [to_screen(x_start, y), to_screen(x_end, y)],
+            egui::Stroke::new(1.0, color),
+        );
+        y += step;
+    }
 }
 
 /// Draw one cached preview at the canvas position of its region.
@@ -916,12 +1049,14 @@ mod tests {
         });
         series.stats = Some(result.stats.clone());
         series.loaded = true;
-        let image = demo::encode(&result, None, MAX_PREVIEW_DIM, [1.244, 1.0, 2.010]);
+        let image = demo::encode(&result, None, MAX_PREVIEW_DIM, [1.244, 1.0, 2.010], 1);
         let mut state = GuiState::new(Mode::Demo);
         state.series = vec![series];
         state.previews[0] = Some(PreviewSlot {
             image,
+            source: ViewSource::Merged,
             rect: None,
+            step: 1,
             generation: 1,
         });
         state.stage = Stage::Done;
@@ -953,9 +1088,41 @@ mod tests {
             let shapes = run_frame(&mut state, &mut cache);
             assert!(shapes > 0, "egui produced no shapes");
         }
-        assert!(cache.handle.is_some(), "preview texture was not uploaded");
-        assert_eq!(cache.size, (640, 424));
+        assert!(!cache.textures.is_empty(), "preview texture was not uploaded");
+        assert_eq!(cache.textures[0].1.size_vec2(), Vec2::new(640.0, 424.0));
         assert!(state.view.zoom > 0.0 && state.view.zoom < 2.0);
+    }
+
+    #[test]
+    fn left_panel_tabs_render_their_content() {
+        let mut state = demo_state();
+        let mut cache = PreviewCache::default();
+        for tab in [LeftTab::Series, LeftTab::Params, LeftTab::Settings] {
+            state.left_tab = tab;
+            let shapes = run_frame(&mut state, &mut cache);
+            assert!(shapes > 0, "{tab:?} tab produced no shapes");
+        }
+    }
+
+    #[test]
+    fn alignment_grid_draws_and_follows_the_distortion_sliders() {
+        let mut state = demo_state();
+        state.view.grid = true;
+        state.view.fitted = false;
+        state.view.zoom = 1.0;
+        let mut cache = PreviewCache::default();
+        assert!(run_frame(&mut state, &mut cache) > 0, "grid frame drew nothing");
+
+        // Toggled off, the grid still appears while a slider is being dragged.
+        state.view.grid = false;
+        state.options.distort = crate::distort::Distortion::new(0.001, 0.0);
+        state.poll_distort(std::time::Instant::now());
+        assert!(state.distortion_being_edited());
+        assert!(run_frame(&mut state, &mut cache) > 0);
+        // Once the debounce commits the slider move, it hides again.
+        let later = std::time::Instant::now() + crate::app::model::DISTORT_DEBOUNCE;
+        assert!(state.poll_distort(later));
+        assert!(!state.distortion_being_edited());
     }
 
     #[test]
@@ -964,12 +1131,12 @@ mod tests {
         state.options = EditOptions::default();
         state.options.scale = ScaleMode::Two;
         state.options.format = OutFormat::Tiff;
-        state.options.compression = Compression::Deflate;
+        state.options.compression = Compression::Lossless;
         let mut cache = PreviewCache::default();
         run_frame(&mut state, &mut cache);
         assert_eq!(
             state.options.compression_note(),
-            Some("16-bit TIFF: deflate would shrink the file ~1.5-2x, but this build writes TIFF uncompressed")
+            Some("AdobeDeflate + predictor: the size estimate above assumes no compression, expect roughly half")
         );
         let estimate = state.output_estimate().unwrap();
         assert_eq!((estimate.width, estimate.height), (1280, 848));

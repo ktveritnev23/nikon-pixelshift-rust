@@ -42,6 +42,9 @@ pub enum Command {
     View {
         source: ViewSource,
         rect: Option<(usize, usize, usize, usize)>,
+        /// Pyramid level of a crop: one output sample per step x step block
+        /// (1 = full resolution); ignored for the base preview.
+        step: u32,
     },
     /// Re-rectify the merged result with new lens distortion coefficients and
     /// send a fresh preview; the export uses the same values.
@@ -61,6 +64,7 @@ pub enum Command {
         tiff_render: bool,
         downsample: bool,
         also_1x: bool,
+        compression: crate::app::model::Compression,
     },
     Shutdown,
 }
@@ -86,6 +90,7 @@ pub enum Event {
     Preview {
         source: ViewSource,
         rect: Option<(usize, usize, usize, usize)>,
+        step: u32,
         image: PreviewImage,
     },
     Saved {
@@ -201,7 +206,7 @@ impl Session {
                 options,
                 save,
             } => self.load(index, &options, save),
-            Command::View { source, rect } => self.view(source, rect),
+            Command::View { source, rect, step } => self.view(source, rect, step),
             Command::Distort { distort } => self.distort(distort),
             Command::FitDistort { reference } => self.fit_distort(&reference),
             Command::SaveAs {
@@ -212,12 +217,13 @@ impl Session {
                 tiff_render,
                 downsample,
                 also_1x,
+                compression,
             } => {
                 self.stage(Stage::Saving);
-                self.write(index, &path, format, flavor, tiff_render, downsample)?;
+                self.write(index, &path, format, flavor, tiff_render, downsample, compression)?;
                 if also_1x && !downsample && self.scale > 1 {
                     let one_x = pipeline::sibling_1x_path(&path);
-                    self.write(index, &one_x, format, flavor, tiff_render, true)?;
+                    self.write(index, &one_x, format, flavor, tiff_render, true, compression)?;
                 }
                 self.stage(Stage::Done);
                 self.send(Event::Finished);
@@ -264,7 +270,7 @@ impl Session {
         }
         self.distort = distort;
         self.rebuild_rectified()?;
-        self.view(ViewSource::Merged, None)
+        self.view(ViewSource::Merged, None, 1)
     }
 
     /// Fit the coefficients of the merged result against an exported reference
@@ -386,7 +392,7 @@ impl Session {
 
         self.stage(Stage::Previewing);
         self.send(Event::Progress(0.85));
-        self.view(ViewSource::Merged, None)?;
+        self.view(ViewSource::Merged, None, 1)?;
 
         if let Some(target) = save {
             self.stage(Stage::Saving);
@@ -397,6 +403,7 @@ impl Session {
                 target.flavor,
                 target.tiff_render,
                 false,
+                options.compression,
             )?;
             if target.also_1x && self.scale > 1 {
                 let path = pipeline::sibling_1x_path(&target.path);
@@ -407,6 +414,7 @@ impl Session {
                     target.flavor,
                     target.tiff_render,
                     true,
+                    options.compression,
                 )?;
             }
         }
@@ -419,23 +427,25 @@ impl Session {
         &mut self,
         source: ViewSource,
         rect: Option<(usize, usize, usize, usize)>,
+        step: u32,
     ) -> Result<()> {
         let image = match source {
             ViewSource::Merged => {
                 let result = self.image()?;
-                self.render_merged(result, rect)?
+                self.render_merged(result, rect, step)?
             }
             ViewSource::Reference => {
                 let frame = self
                     .frames
                     .first()
                     .ok_or_else(|| anyhow!("no reference frame decoded yet"))?;
-                pipeline::reference_preview(frame, rect, MAX_PREVIEW_DIM, self.wb)
+                pipeline::reference_preview(frame, rect, MAX_PREVIEW_DIM, self.wb, step)
             }
         };
         self.send(Event::Preview {
             source,
             rect,
+            step,
             image,
         });
         Ok(())
@@ -445,15 +455,16 @@ impl Session {
         &self,
         result: &MergeResult,
         rect: Option<(usize, usize, usize, usize)>,
+        step: u32,
     ) -> Result<PreviewImage> {
         let attempt = match rect {
             None => pipeline::preview(result, MAX_PREVIEW_DIM, self.wb),
-            Some(rect) => pipeline::crop_preview(result, rect, self.wb),
+            Some(rect) => pipeline::crop_preview(result, rect, step, self.wb),
         };
         match attempt {
             Ok(image) => Ok(image),
             Err(error) if self.mode == Mode::Demo && pipeline::is_unavailable(&error) => {
-                Ok(demo::encode(result, rect, MAX_PREVIEW_DIM, self.wb))
+                Ok(demo::encode(result, rect, MAX_PREVIEW_DIM, self.wb, step))
             }
             Err(error) => Err(error),
         }
@@ -467,6 +478,7 @@ impl Session {
         flavor: DngFlavor,
         tiff_render: bool,
         downsample: bool,
+        compression: crate::app::model::Compression,
     ) -> Result<()> {
         let result = self.image()?;
         let reference = self
@@ -488,15 +500,7 @@ impl Session {
             result
         };
         self.send(Event::Progress(0.95));
-        let outcome = pipeline::write_output(
-            path,
-            image,
-            &meta,
-            format,
-            crate::app::model::Compression::None,
-            flavor,
-            tiff_render,
-        );
+        let outcome = pipeline::write_output(path, image, &meta, format, compression, flavor, tiff_render);
         let (final_path, bytes) = match outcome {
             Ok(bytes) => (path.to_path_buf(), bytes),
             Err(error) if self.mode == Mode::Demo && pipeline::is_unavailable(&error) => {

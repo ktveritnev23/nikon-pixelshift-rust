@@ -94,7 +94,7 @@ fn work_dir(name: &str) -> PathBuf {
 fn fit_of_an_undistorted_pair_finds_nothing() {
     let image = scene_image(W, H);
     let path = work_dir("identity.tif");
-    write_tiff16(&path, &image, &DngMeta::default()).expect("write the reference");
+    write_tiff16(&path, &image, &DngMeta::default(), false).expect("write the reference");
     let report = fit_from_reference(&image, &path).expect("fit");
     eprintln!("identity: {}", report.summary());
     assert!(report.blocks >= 20, "only {} blocks matched", report.blocks);
@@ -119,7 +119,7 @@ fn fit_recovers_three_terms_from_a_distorted_pair_barrel() {
     let clean = scene_image(W, H);
     let recorded = apply_lens(clean.clone(), known);
     let path = work_dir("known-barrel.tif");
-    write_tiff16(&path, &clean, &DngMeta::default()).expect("write the reference");
+    write_tiff16(&path, &clean, &DngMeta::default(), false).expect("write the reference");
     let report = fit_from_reference(&recorded, &path).expect("fit");
     eprintln!("barrel known {} -> {}", known, report.summary());
     for (name, got, want) in [
@@ -138,7 +138,7 @@ fn fit_recovers_three_terms_from_a_distorted_pair() {
     let clean = scene_image(W, H);
     let recorded = apply_lens(clean.clone(), known);
     let path = work_dir("known.tif");
-    write_tiff16(&path, &clean, &DngMeta::default()).expect("write the reference");
+    write_tiff16(&path, &clean, &DngMeta::default(), false).expect("write the reference");
 
     let report = fit_from_reference(&recorded, &path).expect("fit");
     eprintln!("known {} -> {}", known, report.summary());
@@ -185,7 +185,7 @@ fn fit_rejects_a_reference_of_a_different_size() {
     let image = scene_image(256, 192);
     let other = scene_image(128, 96);
     let path = work_dir("wrong-size.tif");
-    write_tiff16(&path, &other, &DngMeta::default()).expect("write the reference");
+    write_tiff16(&path, &other, &DngMeta::default(), false).expect("write the reference");
     let error = fit_from_reference(&image, &path).expect_err("size mismatch must fail");
     let text = format!("{error:#}");
     assert!(text.contains("128 x 96"), "unhelpful message: {text}");
@@ -196,7 +196,7 @@ fn fit_rejects_a_reference_of_a_different_size() {
 fn tiff_reader_round_trips_a_16_bit_rgb_image() {
     let image = scene_image(64, 48);
     let path = work_dir("round16.tif");
-    write_tiff16(&path, &image, &DngMeta::default()).expect("write");
+    write_tiff16(&path, &image, &DngMeta::default(), false).expect("write");
     let read = tiffread::read_rgb(&path).expect("read back");
     assert_eq!((read.width, read.height, read.bits), (64, 48, 16));
     for c in 0..3 {

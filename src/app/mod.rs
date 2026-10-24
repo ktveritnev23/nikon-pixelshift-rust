@@ -97,6 +97,8 @@ struct PixelShiftApp {
     cache: ui::PreviewCache,
     worker: Worker,
     last_selected: usize,
+    /// Paths of the last processed drag-and-drop, to ignore repeat reports.
+    last_dropped: Vec<PathBuf>,
     prefs: UiPrefs,
     saved_prefs: UiPrefs,
     overrides: PrefsOverrides,
@@ -155,6 +157,7 @@ impl PixelShiftApp {
             cache: ui::PreviewCache::default(),
             worker,
             last_selected: 0,
+            last_dropped: Vec::new(),
             prefs,
             saved_prefs,
             overrides,
@@ -335,8 +338,8 @@ impl PixelShiftApp {
                     let index = self.state.selected;
                     self.load_selected(index, None);
                 }
-                Request::View { source, rect } => {
-                    self.worker.send(Command::View { source, rect });
+                Request::View { source, rect, step } => {
+                    self.worker.send(Command::View { source, rect, step });
                 }
                 Request::Distort { distort } => {
                     self.worker.send(Command::Distort { distort });
@@ -363,6 +366,7 @@ impl PixelShiftApp {
                         tiff_render: self.state.options.tiff_render,
                         downsample,
                         also_1x: self.state.options.also_1x,
+                        compression: self.state.options.compression,
                     });
                 }
                 Request::StartBatch => {
@@ -403,6 +407,27 @@ impl eframe::App for PixelShiftApp {
                 self.prefs_stored = true;
             }
         }
+        // Drag-and-drop: folders and raw files dropped anywhere on the window
+        // load like the "Open" buttons. egui reports the drop for one frame;
+        // the guard keeps a repeated report from re-scanning.
+        let dropped = ui.ctx().input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .collect::<Vec<_>>()
+        });
+        if !dropped.is_empty() && self.last_dropped != dropped {
+            self.last_dropped = dropped.clone();
+            let (valid, skipped) = split_dropped_paths(&dropped);
+            for path in skipped {
+                self.state
+                    .push_log(format!("skipped {}: not a folder or a raw file", path.display()));
+            }
+            if !valid.is_empty() {
+                self.state.requests.push(crate::app::model::Request::Scan(valid));
+            }
+        }
         self.handle_requests(ui.ctx());
         if let Some(shot) = self.shot.as_mut() {
             shot.step(&mut self.state, ui.ctx());
@@ -436,6 +461,52 @@ fn load_prefs(storage: Option<&dyn eframe::Storage>, state: &mut GuiState) -> Ui
             }
             UiPrefs::default()
         }
+    }
+}
+
+/// Split dropped paths into loadable inputs (folders and Nikon raw files, the
+/// same set the "Open files" dialog accepts) and everything else, preserving
+/// order.
+fn split_dropped_paths(paths: &[std::path::PathBuf]) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+    let mut valid = Vec::new();
+    let mut skipped = Vec::new();
+    for path in paths {
+        let is_raw = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "nef" | "nrw"))
+            .unwrap_or(false);
+        if path.is_dir() || (path.is_file() && is_raw) {
+            valid.push(path.clone());
+        } else {
+            skipped.push(path.clone());
+        }
+    }
+    (valid, skipped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_dropped_paths;
+    use std::path::PathBuf;
+
+    #[test]
+    fn dropped_paths_split_into_folders_raws_and_the_rest() {
+        let dir = std::env::temp_dir();
+        let raw = dir.join("drop-test.nef");
+        std::fs::write(&raw, b"x").expect("write temp nef");
+        let text = dir.join("drop-test.txt");
+        std::fs::write(&text, b"x").expect("write temp txt");
+        let missing_nef = PathBuf::from("/definitely/missing/series.NEF");
+        let (valid, skipped) = split_dropped_paths(&[
+            dir.clone(),
+            raw.clone(),
+            text.clone(),
+            missing_nef.clone(),
+        ]);
+        assert_eq!(valid, vec![dir, raw]);
+        // A raw-sounding path that does not exist is not loadable either.
+        assert_eq!(skipped, vec![text, missing_nef]);
     }
 }
 // ---------------------------------------------------------------- shot ------
@@ -546,6 +617,7 @@ impl Shot {
             state.requests.push(Request::View {
                 source: ViewSource::Reference,
                 rect: None,
+                step: 1,
             });
         }
         let ready = state.previews[self.request.source.index()]
@@ -575,6 +647,7 @@ impl Shot {
                 state.requests.push(Request::View {
                     source: self.request.source,
                     rect: Some((x, y, w, h)),
+                    step: 1,
                 });
             }
             None => match self.request.zoom {
@@ -603,7 +676,9 @@ impl Shot {
 
     fn wait_settled(&mut self, state: &mut GuiState, ctx: &egui::Context) {
         let crop_ok = match self.crop {
-            Some(rect) => state.crop_for(Some(rect)).is_some(),
+            Some(rect) => state
+                .crop_for(Some(crate::app::model::CropWant { rect, step: 1 }))
+                .is_some(),
             None => true,
         };
         let save_ok = !self.save_pending

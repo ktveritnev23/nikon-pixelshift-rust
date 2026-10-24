@@ -83,30 +83,28 @@ impl OutFormat {
         }
     }
 
-    /// Whether the writer compresses the image data.
-    ///
-    /// 16-bit linear DNG is always stored uncompressed: LibRaw cannot read
-    /// deflated 16-bit strips, so compressing would produce a file no raw
-    /// converter opens. The 16-bit TIFF writer has no compression parameter yet.
+    /// Whether the writer compresses the image data: lossless JPEG for the
+    /// DNG (Compression = 7, what LibRaw and the Adobe readers decode), Adobe
+    /// Deflate with the horizontal predictor for the TIFF.
     pub fn use_compression(self, compression: Compression) -> bool {
-        let _ = (self, compression);
-        false
+        compression == Compression::Lossless
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Compression {
     None,
-    Deflate,
+    /// DNG: lossless JPEG (Compression = 7); TIFF: AdobeDeflate + Predictor 2.
+    Lossless,
 }
 
 impl Compression {
-    pub const ALL: [Compression; 2] = [Compression::None, Compression::Deflate];
+    pub const ALL: [Compression; 2] = [Compression::None, Compression::Lossless];
 
     pub fn label(self) -> &'static str {
         match self {
             Compression::None => "none",
-            Compression::Deflate => "deflate",
+            Compression::Lossless => "lossless",
         }
     }
 }
@@ -162,11 +160,11 @@ impl EditOptions {
     pub fn compression_note(&self) -> Option<&'static str> {
         match (self.format, self.compression) {
             (_, Compression::None) => None,
-            (OutFormat::Dng, Compression::Deflate) => Some(
-                "16-bit deflate is not readable by LibRaw: the linear DNG is written uncompressed",
+            (OutFormat::Dng, Compression::Lossless) => Some(
+                "lossless JPEG: the size estimate above assumes no compression, expect roughly half",
             ),
-            (OutFormat::Tiff, Compression::Deflate) => Some(
-                "16-bit TIFF: deflate would shrink the file ~1.5-2x, but this build writes TIFF uncompressed",
+            (OutFormat::Tiff, Compression::Lossless) => Some(
+                "AdobeDeflate + predictor: the size estimate above assumes no compression, expect roughly half",
             ),
         }
     }
@@ -306,12 +304,61 @@ impl SeriesView {
 }
 
 /// One cached preview image plus the region of the full resolution image it
-/// covers (None means the whole image).
+/// covers (None means the whole image), the view it belongs to and the
+/// pyramid step it was rendered at (1 = full resolution samples).
 #[derive(Clone)]
 pub struct PreviewSlot {
     pub image: PreviewImage,
+    pub source: ViewSource,
     pub rect: Option<(usize, usize, usize, usize)>,
+    pub step: u32,
     pub generation: u64,
+}
+
+/// A crop the canvas wants: image rectangle (full resolution coordinates,
+/// before step alignment) plus the pyramid step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CropWant {
+    pub rect: (usize, usize, usize, usize),
+    pub step: u32,
+}
+
+/// Native-pixel alignment factor of a crop request. Merged crops tile the
+/// output grid at `step` pixels per block; reference crops tile the CFA block
+/// grid, which is 2 native pixels per block.
+pub fn crop_alignment(source: ViewSource, step: u32) -> usize {
+    match source {
+        ViewSource::Merged => step.max(1) as usize,
+        ViewSource::Reference => 2 * step.max(1) as usize,
+    }
+}
+
+/// Expand the rectangle outward to whole `factor`-pixel blocks so reduced
+/// step crops cover complete samples; blocks clipped by the image border stay
+/// partial and the renderers average only the real samples.
+pub fn align_rect(
+    rect: (usize, usize, usize, usize),
+    factor: usize,
+    dims: (usize, usize),
+) -> (usize, usize, usize, usize) {
+    if factor <= 1 || dims.0 == 0 || dims.1 == 0 {
+        return rect;
+    }
+    let x0 = rect.0.min(dims.0.saturating_sub(1)) / factor * factor;
+    let y0 = rect.1.min(dims.1.saturating_sub(1)) / factor * factor;
+    let x1 = (((rect.0 + rect.2).min(dims.0)).max(x0 + 1) + factor - 1) / factor * factor;
+    let y1 = (((rect.1 + rect.3).min(dims.1)).max(y0 + 1) + factor - 1) / factor * factor;
+    (x0, y0, x1.min(dims.0).max(x0 + 1) - x0, y1.min(dims.1).max(y0 + 1) - y0)
+}
+
+/// Which tab of the left panel is open. Session state (not persisted): the
+/// tab returns to "Series" on the next launch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LeftTab {
+    #[default]
+    Series,
+    Params,
+    Settings,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -322,6 +369,8 @@ pub struct CanvasView {
     /// Show a 1:1 crop of the merged result instead of the fitted preview.
     pub crop: bool,
     pub source: ViewSource,
+    /// Overlay a straight grid on the image, for manual lens alignment.
+    pub grid: bool,
     /// Zoom and centre still follow the fit-to-window rule.
     pub fitted: bool,
 }
@@ -333,6 +382,7 @@ impl Default for CanvasView {
             center: [0.0, 0.0],
             crop: false,
             source: ViewSource::Merged,
+            grid: false,
             fitted: true,
         }
     }
@@ -348,6 +398,7 @@ pub enum Request {
     View {
         source: ViewSource,
         rect: Option<(usize, usize, usize, usize)>,
+        step: u32,
     },
     Distort {
         distort: crate::distort::Distortion,
@@ -368,6 +419,8 @@ pub enum Request {
 pub struct GuiState {
     pub mode: Mode,
     pub options: EditOptions,
+    /// Which tab of the left panel is open.
+    pub left_tab: LeftTab,
     pub series: Vec<SeriesView>,
     pub selected: usize,
     pub selected_frame: usize,
@@ -391,9 +444,9 @@ pub struct GuiState {
     stage_started: Option<Instant>,
     generation: u64,
     /// Wanted crop and the instant the debounce expires.
-    pending_crop: Option<(Option<(usize, usize, usize, usize)>, Instant)>,
+    pending_crop: Option<(Option<CropWant>, Instant)>,
     /// Crop request already handed to the worker and not answered yet.
-    crop_inflight: Option<Option<(usize, usize, usize, usize)>>,
+    crop_inflight: Option<Option<CropWant>>,
     /// Coefficients the worker currently uses.
     distort_committed: crate::distort::Distortion,
     /// Last measured fit, shown next to the distortion controls.
@@ -407,6 +460,7 @@ impl GuiState {
         Self {
             mode,
             options: EditOptions::default(),
+            left_tab: LeftTab::default(),
             series: Vec::new(),
             selected: 0,
             selected_frame: 0,
@@ -462,22 +516,43 @@ impl GuiState {
         self.crop_inflight = None;
     }
 
-    /// Cached crop that covers the wanted window, smallest one first.
-    pub fn crop_for(
-        &self,
-        wanted: Option<(usize, usize, usize, usize)>,
-    ) -> Option<&PreviewSlot> {
-        let wanted = wanted?;
+    /// Align a wanted crop onto the block grid of the active source, so the
+    /// request, the cache entry and the coverage check all describe the same
+    /// rectangle.
+    fn aligned_want(&self, want: CropWant) -> CropWant {
+        let factor = crop_alignment(self.view.source, want.step);
+        match self.image_size() {
+            Some(dims) => CropWant {
+                rect: align_rect(want.rect, factor, dims),
+                step: want.step,
+            },
+            None => want,
+        }
+    }
+
+    /// Cached crop that covers the wanted window, smallest one first. Only
+    /// crops of the active view qualify, and only when they are at least as
+    /// detailed as the wanted step (a finer cached crop is a valid stand-in).
+    pub fn crop_for(&self, wanted: Option<CropWant>) -> Option<&PreviewSlot> {
+        let wanted = wanted.map(|w| self.aligned_want(w))?;
         self.crops
             .iter()
-            .filter(|slot| slot.rect.map(|rect| covers(rect, wanted)).unwrap_or(false))
+            .filter(|slot| {
+                slot.source == self.view.source
+                    && slot.step <= wanted.step
+                    && slot
+                        .rect
+                        .map(|rect| covers(rect, wanted.rect))
+                        .unwrap_or(false)
+            })
             .min_by_key(|slot| slot.rect.map(|rect| rect.2 * rect.3).unwrap_or(usize::MAX))
     }
 
-    /// Ask the worker for a detail crop of the visible window, after the
+    /// Ask the worker for a crop of the visible window, after the
     /// debounce and only when the cached crops do not already cover it.
     /// Returns true while a crop is on its way or being computed.
-    pub fn poll_lod(&mut self, wanted: Option<(usize, usize, usize, usize)>, now: Instant) -> bool {
+    pub fn poll_lod(&mut self, wanted: Option<CropWant>, now: Instant) -> bool {
+        let wanted = wanted.map(|w| self.aligned_want(w));
         let covered = wanted.is_none() || self.crop_for(wanted).is_some();
         if covered {
             self.pending_crop = None;
@@ -495,10 +570,13 @@ impl GuiState {
                     self.pending_crop = None;
                     self.crop_inflight = Some(wanted);
                     self.crop_pending = true;
-                    self.requests.push(Request::View {
-                        source: self.view.source,
-                        rect: wanted,
-                    });
+                    if let Some(want) = wanted {
+                        self.requests.push(Request::View {
+                            source: self.view.source,
+                            rect: Some(want.rect),
+                            step: want.step,
+                        });
+                    }
                 }
             }
             _ => {
@@ -507,6 +585,12 @@ impl GuiState {
             }
         }
         self.crop_pending
+    }
+
+    /// True while a distortion slider is being dragged (between the first
+    /// move and the debounce commit): the canvas shows the alignment grid.
+    pub fn distortion_being_edited(&self) -> bool {
+        self.distort_edited.is_some()
     }
 
     /// True when the live distortion preview has to be recomputed now.
@@ -658,20 +742,27 @@ impl GuiState {
             Event::Preview {
                 source,
                 rect,
+                step,
                 image,
             } => {
                 self.generation += 1;
                 let slot = PreviewSlot {
                     image,
+                    source,
                     rect,
+                    step,
                     generation: self.generation,
                 };
                 match rect {
                     None => self.previews[source.index()] = Some(slot),
                     Some(rect) => {
-                        // Newest first; an older copy of the same window is
-                        // stale and must not shadow it.
-                        self.crops.retain(|cached| cached.rect != Some(rect));
+                        // Newest first; cached copies of the same window that
+                        // are coarser or equal are superseded, finer ones stay.
+                        self.crops.retain(|cached| {
+                            !(cached.source == source
+                                && cached.rect == Some(rect)
+                                && cached.step >= step)
+                        });
                         self.crops.insert(0, slot);
                         self.crops.truncate(CROP_CACHE_LEN);
                     }
@@ -712,6 +803,18 @@ impl GuiState {
             ViewSource::Merged => series.result.map(|r| (r.width, r.height)),
             ViewSource::Reference => series.frames.first().map(|f| (f.width, f.height)),
         }
+    }
+
+    /// Sampling grid of the active source: output pixels for the merged view,
+    /// 2x2 CFA blocks for the reference view. The canvas picks the pyramid
+    /// step against this grid so both views hand the worker a similarly sized
+    /// texture.
+    pub fn sample_grid(&self) -> Option<(usize, usize)> {
+        let dims = self.image_size()?;
+        Some(match self.view.source {
+            ViewSource::Merged => dims,
+            ViewSource::Reference => (dims.0.div_ceil(2), dims.1.div_ceil(2)),
+        })
     }
 
     pub fn output_estimate(&self) -> Option<ResultInfo> {
@@ -803,40 +906,32 @@ pub fn covers(
         && outer.1 + outer.3 >= inner.1 + inner.3
 }
 
-/// Which level of the preview pyramid the canvas has to ask for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LodLevel {
-    /// The whole image preview is enough.
-    Base,
-    /// A 1:1 crop of the visible window carries more detail than the base one.
-    Detail,
-}
-
-/// Base preview holds the whole frame at base_dim on the long side. Once it is
-/// magnified past 1:1 (zoom above the preview/image pixel ratio) and the visible
-/// window is no larger than the base preview, a crop of the full resolution
-/// image is both more honest and affordable; below that threshold it would only
-/// cost a render without showing anything new.
-pub fn lod_level(
+/// Which pyramid level the canvas has to ask for: None when the base preview
+/// is enough, otherwise the downsampling step of the crop (a power of two,
+/// 1 = full resolution). The step is the smallest power of two that brings
+/// the visible window down to `base_dim` samples on its long side, so every
+/// zoom level gets a texture sized to the viewport instead of jumping between
+/// the base preview and a full resolution crop.
+pub fn lod_step(
     zoom: f32,
     viewport: [f32; 2],
     image: (usize, usize),
     base_dim: u32,
-) -> LodLevel {
+) -> Option<u32> {
     if zoom <= 0.0 || image.0 == 0 || image.1 == 0 || base_dim == 0 {
-        return LodLevel::Base;
+        return None;
     }
     let longest = image.0.max(image.1) as f32;
     let base_ratio = base_dim as f32 / longest;
     if zoom <= base_ratio {
-        return LodLevel::Base;
+        return None;
     }
     let window = viewport[0].max(viewport[1]).max(1.0) / zoom;
-    if window <= base_dim as f32 {
-        LodLevel::Detail
-    } else {
-        LodLevel::Base
+    let mut step = 1u32;
+    while window / step as f32 > base_dim as f32 {
+        step *= 2;
     }
+    Some(step)
 }
 
 /// Keep the view centre inside the image for the current zoom.
@@ -882,6 +977,78 @@ mod tests {
     }
 
     #[test]
+    fn crop_cache_is_keyed_by_source_and_step() {
+        let frames = crate::app::demo::frames();
+        let result = crate::app::demo::result(1, &frames);
+        let mut series = SeriesView::new(crate::app::demo::series());
+        series.result = Some(ResultInfo {
+            width: result.width,
+            height: result.height,
+            scale: 1,
+            white: result.white,
+        });
+        let mut state = GuiState::new(Mode::Demo);
+        state.series = vec![series];
+
+        let want = CropWant {
+            rect: (16, 16, 320, 208),
+            step: 1,
+        };
+        assert_eq!(
+            state.aligned_want(want).rect,
+            want.rect,
+            "step 1 alignment is the identity"
+        );
+
+        // A merged crop of that window arrives.
+        let tiny = PreviewImage {
+            width: 2,
+            height: 2,
+            rgb: vec![0; 12],
+        };
+        state.apply(Event::Preview {
+            source: ViewSource::Merged,
+            rect: Some(want.rect),
+            step: 1,
+            image: tiny.clone(),
+        });
+        assert!(state.crop_for(Some(want)).is_some());
+
+        // The same window in the reference view is NOT covered by it.
+        state.view.source = ViewSource::Reference;
+        assert!(state.crop_for(Some(want)).is_none());
+
+        // A coarser reference crop covers the step 2 want but not step 1.
+        state.apply(Event::Preview {
+            source: ViewSource::Reference,
+            rect: Some(want.rect),
+            step: 2,
+            image: tiny,
+        });
+        assert!(state.crop_for(Some(CropWant { step: 2, ..want })).is_some());
+        assert!(state.crop_for(Some(want)).is_none());
+
+        // And a finer new arrival evicts the coarser copy of the same window.
+        state.apply(Event::Preview {
+            source: ViewSource::Reference,
+            rect: Some(want.rect),
+            step: 1,
+            image: crate::app::demo::encode(&result, Some(want.rect), 1, [1.0, 1.0, 1.0], 1),
+        });
+        let cached = state.crop_for(Some(want)).expect("step 1 reference crop cached");
+        assert_eq!(cached.step, 1);
+        assert_eq!(
+            state
+                .crops
+                .iter()
+                .filter(|c| c.source == ViewSource::Reference && c.rect == Some(want.rect))
+                .count(),
+            1,
+            "the superseded coarser copy was dropped"
+        );
+    }
+
+    #[test]
     fn visible_rect_is_only_returned_when_it_buys_detail() {
         let image = (6048, 4032);
         assert_eq!(
@@ -895,24 +1062,43 @@ mod tests {
     }
 
     #[test]
-    fn lod_switches_to_a_detail_crop_when_the_base_preview_is_magnified() {
+    fn lod_switches_to_a_step_ladder_when_the_base_preview_is_magnified() {
         let image = (6048, 4032);
         let viewport = [1200.0, 800.0];
         // Whole frame below the preview ratio: the base preview is enough.
-        assert_eq!(lod_level(0.1, viewport, image, MAX_PREVIEW_DIM), LodLevel::Base);
-        // Magnified past 1:1 but the window still needs more pixels than the
-        // base preview has: a crop would not fit in one texture.
-        assert_eq!(lod_level(0.35, viewport, image, MAX_PREVIEW_DIM), LodLevel::Base);
-        assert_eq!(lod_level(0.6, viewport, image, MAX_PREVIEW_DIM), LodLevel::Detail);
-        assert_eq!(lod_level(1.0, viewport, image, MAX_PREVIEW_DIM), LodLevel::Detail);
-        assert_eq!(lod_level(8.0, viewport, image, MAX_PREVIEW_DIM), LodLevel::Detail);
-        // A big 2x result behaves the same way relative to its own size.
+        assert_eq!(lod_step(0.1, viewport, image, MAX_PREVIEW_DIM), None);
+        // Magnified past 1:1: the step is the smallest power of two that fits
+        // the visible window into the base dimension, full resolution once
+        // the window itself is small enough.
+        assert_eq!(lod_step(0.35, viewport, image, MAX_PREVIEW_DIM), Some(2));
+        assert_eq!(lod_step(0.6, viewport, image, MAX_PREVIEW_DIM), Some(1));
+        assert_eq!(lod_step(1.0, viewport, image, MAX_PREVIEW_DIM), Some(1));
+        assert_eq!(lod_step(8.0, viewport, image, MAX_PREVIEW_DIM), Some(1));
+        // Barely past the base ratio the window is large: a coarse step first.
+        assert_eq!(lod_step(0.34, viewport, image, MAX_PREVIEW_DIM), Some(2));
         let two_x = (12096, 8064);
-        assert_eq!(lod_level(0.35, viewport, two_x, MAX_PREVIEW_DIM), LodLevel::Base);
-        assert_eq!(lod_level(0.7, viewport, two_x, MAX_PREVIEW_DIM), LodLevel::Detail);
+        assert_eq!(lod_step(0.35, viewport, two_x, MAX_PREVIEW_DIM), Some(2));
+        assert_eq!(lod_step(0.7, viewport, two_x, MAX_PREVIEW_DIM), Some(1));
         // Degenerate inputs never ask for a crop.
-        assert_eq!(lod_level(0.0, viewport, image, MAX_PREVIEW_DIM), LodLevel::Base);
-        assert_eq!(lod_level(2.0, viewport, (0, 0), MAX_PREVIEW_DIM), LodLevel::Base);
+        assert_eq!(lod_step(0.0, viewport, image, MAX_PREVIEW_DIM), None);
+        assert_eq!(lod_step(2.0, viewport, (0, 0), MAX_PREVIEW_DIM), None);
+    }
+
+    #[test]
+    fn crop_wants_are_aligned_to_the_block_grid_of_their_source() {
+        let dims = (12096, 8064);
+        let rect = (1001, 2003, 1500, 1000);
+        assert_eq!(align_rect(rect, 4, dims), (1000, 2000, 1504, 1004));
+        // Alignment is idempotent.
+        let aligned = align_rect(rect, 4, dims);
+        assert_eq!(align_rect(aligned, 4, dims), aligned);
+        // Factor 1 and degenerate dims pass the rect through.
+        assert_eq!(align_rect(rect, 1, dims), rect);
+        assert_eq!(align_rect(rect, 4, (0, 0)), rect);
+        // The right/bottom border clamps to the image instead of overshooting.
+        let edge = align_rect((12090, 8060, 6, 4), 4, dims);
+        assert!(edge.0 + edge.2 <= dims.0 && edge.1 + edge.3 <= dims.1);
+        assert!(covers(edge, (12090, 8060, 6, 4)) || edge.0 + edge.2 == dims.0);
     }
 
     #[test]

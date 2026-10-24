@@ -864,7 +864,71 @@ pub fn preview_crop(
     encode_srgb(&buf, w, h)
 }
 
-fn encode_srgb(buf: &[f32], w: usize, h: usize) -> PreviewImage {
+/// Crop a window at a reduced sampling step: one output sample per step x
+/// step block, box averaged (f64 like the base preview), so intermediate zoom
+/// levels get a texture sized to the viewport instead of jumping straight
+/// between the 2048 px base preview and a full resolution 1:1 crop. The
+/// rectangle is aligned outward to block boundaries; blocks clipped by the
+/// image border contribute only their real samples. `step = 1` is exactly
+/// `preview_crop`.
+pub fn preview_crop_at(
+    img: &MergeResult,
+    rect: (usize, usize, usize, usize),
+    step: u32,
+    wb: [f32; 3],
+) -> PreviewImage {
+    if step <= 1 {
+        return preview_crop(img, rect, wb);
+    }
+    let s = step as usize;
+    let x0 = rect.0.min(img.width);
+    let y0 = rect.1.min(img.height);
+    let x1 = (rect.0 + rect.2).min(img.width).max(x0);
+    let y1 = (rect.1 + rect.3).min(img.height).max(y0);
+    if x1 == x0 || y1 == y0 {
+        return PreviewImage {
+            width: 0,
+            height: 0,
+            rgb: Vec::new(),
+        };
+    }
+    let bx0 = x0 - x0 % s;
+    let by0 = y0 - y0 % s;
+    let out_w = (x1 - bx0).div_ceil(s);
+    let out_h = (y1 - by0).div_ceil(s);
+    let mut buf = vec![0.0f32; out_w * out_h * 3];
+    for oy in 0..out_h {
+        let ry0 = by0 + oy * s;
+        let ry1 = (ry0 + s).min(img.height);
+        for ox in 0..out_w {
+            let rx0 = bx0 + ox * s;
+            let rx1 = (rx0 + s).min(img.width);
+            let mut acc = [0.0f64; 3];
+            let mut n = 0.0f64;
+            for yy in ry0..ry1 {
+                let row = yy * img.width;
+                for xx in rx0..rx1 {
+                    let i = row + xx;
+                    for c in 0..3 {
+                        acc[c] += img.planes[c][i] as f64;
+                    }
+                    n += 1.0;
+                }
+            }
+            let o = (oy * out_w + ox) * 3;
+            for c in 0..3 {
+                buf[o + c] = (acc[c] / n.max(1.0)) as f32 * wb[c];
+            }
+        }
+    }
+    encode_srgb(&buf, out_w, out_h)
+}
+
+/// Shared preview finisher for every GUI view: the 99.5 percentile of the
+/// window luminance maps to white, then the samples go through the sRGB
+/// curve. Input is white-balanced linear f32 in 0..~1 scale; using it for
+/// merged and reference views alike keeps them tonally consistent.
+pub(crate) fn encode_srgb(buf: &[f32], w: usize, h: usize) -> PreviewImage {
     if buf.is_empty() {
         return PreviewImage {
             width: 0,
