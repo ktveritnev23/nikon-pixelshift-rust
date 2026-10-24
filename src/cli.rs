@@ -2,7 +2,7 @@
 //!
 //! Required surface:
 //!   pixelshift merge <input...> [--out FILE|DIR] [--scale auto|1|2]
-//!                   [--format dng|tiff] [--compression none|lossless]
+//!                   [--format dng|tiff] [--compression none|lossless] [--motion]
 //!                   [--also-1x] [--no-align] [--threads N] [--quiet]
 //!   pixelshift inspect <input...>
 //!   pixelshift gui [--selftest] [--demo] [--lang auto|en|ru]
@@ -153,6 +153,14 @@ pub struct MergeArgs {
     /// Merge deconvolution strength, 0..2 (0 = pure normalised splatting).
     #[arg(long, value_name = "0..2", value_parser = parse_deconvolve)]
     pub deconvolve: Option<f32>,
+    /// Mask scene motion out of the merge (ghost suppression): areas where a
+    /// frame disagrees with the reference after alignment fall back to the
+    /// reference samples instead of averaging into ghosts.
+    #[arg(long)]
+    pub motion: bool,
+    /// Sensitivity of the motion mask, 0.25..4 (higher masks more).
+    #[arg(long, value_name = "F", default_value_t = 1.0)]
+    pub motion_sensitivity: f32,
     /// Lens distortion correction, K1[,K2[,K3]] of the Brown model; 0 keeps
     /// the merged geometry untouched. Positive k1 removes pincushion.
     #[arg(long, value_name = "K1[,K2[,K3]]", default_value = "0", allow_hyphen_values = true, value_parser = parse_distort)]
@@ -204,6 +212,8 @@ impl MergeArgs {
             deconvolve: self
                 .deconvolve
                 .unwrap_or_else(|| MergeParams::default().deconvolve),
+            motion_enabled: self.motion,
+            motion_sensitivity: self.motion_sensitivity,
             also_1x: self.also_1x,
             align: !self.no_align,
             threads: self.threads,
@@ -220,6 +230,12 @@ pub struct InspectArgs {
     /// Do not estimate shifts (skips decoding the remaining frames).
     #[arg(long)]
     pub no_align: bool,
+    /// Also run the motion detector and report the masked share per frame.
+    #[arg(long)]
+    pub motion: bool,
+    /// Sensitivity of the motion mask, 0.25..4 (higher masks more).
+    #[arg(long, value_name = "F", default_value_t = 1.0)]
+    pub motion_sensitivity: f32,
     /// Lens distortion correction that a merge with these flags would apply.
     #[arg(long, value_name = "K1[,K2[,K3]]", default_value = "0", allow_hyphen_values = true, value_parser = parse_distort)]
     pub distort: crate::distort::Distortion,
@@ -628,6 +644,16 @@ fn merge_one(
         merged.stats.filled_pixels,
         100.0 * merged.stats.filled_pixels as f64 / merged.pixel_count().max(1) as f64
     );
+    if !merged.stats.masked_pct.is_empty() {
+        let worst = merged.stats.masked_pct.iter().cloned().fold(0.0f32, f32::max);
+        let mean = merged.stats.masked_pct.iter().sum::<f32>()
+            / merged.stats.masked_pct.len().max(1) as f32;
+        println!(
+            "  motion    masked {:.1} % mean, {:.1} % worst frame",
+            mean * 100.0,
+            worst * 100.0
+        );
+    }
     for (path, bytes) in &written {
         println!("  wrote     {} ({})", path.display(), pipeline::fmt_bytes(*bytes));
     }
@@ -680,7 +706,19 @@ fn run_inspect(args: InspectArgs) -> Result<()> {
     println!("{} inspect", crate::version());
     let mut failures = 0usize;
     for item in &series {
-        match inspect_one(item, !args.no_align, args.distort) {
+        match inspect_one(
+            item,
+            !args.no_align,
+            args.distort,
+            if args.motion {
+                Some(crate::types::MotionParams {
+                    enabled: true,
+                    sensitivity: args.motion_sensitivity,
+                })
+            } else {
+                None
+            },
+        ) {
             Ok(()) => {}
             Err(error) => {
                 eprintln!("error: {error:#}");
@@ -698,12 +736,20 @@ fn inspect_one(
     series: &SeriesInfo,
     align: bool,
     distort: crate::distort::Distortion,
+    motion: Option<crate::types::MotionParams>,
 ) -> Result<()> {
     let frames = pipeline::decode(&series.files)?;
     let first = frames
         .first()
         .ok_or_else(|| anyhow::anyhow!("{}: no frames", series.name()))?;
     let shifts = pipeline::estimate_shifts(&frames, align)?;
+    let masked = motion.map(|params| {
+        let masks = crate::motion::masks(&frames, &shifts, &params);
+        masks
+            .into_iter()
+            .map(|m| m.map(|mask| mask.masked_fraction()).unwrap_or(0.0))
+            .collect::<Vec<f32>>()
+    });
     let scale = ScaleMode::Auto.resolve(frames.len(), series.suggested_scale);
     let expected = pipeline::expected_output(first.width, first.height, scale);
 
@@ -783,14 +829,19 @@ fn inspect_one(
         );
     }
     for (index, shift) in shifts.iter().enumerate() {
+        let motion_note = match &masked {
+            Some(values) => format!("  mask={:.1}%", values.get(index).copied().unwrap_or(0.0) * 100.0),
+            None => String::new(),
+        };
         println!(
-            "  frame {:2}  dx={:+.3}  dy={:+.3}  rot={:+.1}\"  residual={:.3}  conf={:.2}",
+            "  frame {:2}  dx={:+.3}  dy={:+.3}  rot={:+.1}\"  residual={:.3}  conf={:.2}{}",
             index,
             shift.dx,
             shift.dy,
             shift.rot_arcsec(),
             shift.residual,
-            shift.confidence
+            shift.confidence,
+            motion_note
         );
     }
     println!(

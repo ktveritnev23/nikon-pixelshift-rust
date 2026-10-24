@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Spinning Fan</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: #ffffff;
+    color: #1f2937;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    padding: 20px;
+    user-select: none;
+  }
+  #stage {
+    width: min(76vmin, 560px);
+    aspect-ratio: 1 / 1;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  .panel {
+    width: min(76vmin, 560px);
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 14px;
+    padding: 12px 16px;
+    border: 1px solid #e5e7eb;
+    border-radius: 14px;
+    background: #fcfdff;
+    box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+  }
+  .panel label {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #6b7280;
+  }
+  input[type="range"] {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 22px;
+    background: transparent;
+    cursor: pointer;
+    margin: 0;
+  }
+  input[type="range"]::-webkit-slider-runnable-track {
+    height: 6px;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #dbe4ee, #b9cbe0);
+  }
+  input[type="range"]::-moz-range-track {
+    height: 6px;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #dbe4ee, #b9cbe0);
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 20px;
+    height: 20px;
+    margin-top: -7px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #ffffff, #cbd8e7 45%, #7f95ae);
+    border: 1px solid #6d8299;
+    box-shadow: 0 2px 4px rgba(16, 24, 40, 0.25);
+  }
+  input[type="range"]::-moz-range-thumb {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #ffffff, #cbd8e7 45%, #7f95ae);
+    border: 1px solid #6d8299;
+    box-shadow: 0 2px 4px rgba(16, 24, 40, 0.25);
+  }
+  input[type="range"]:focus-visible { outline: 2px solid #93b4d8; outline-offset: 4px; border-radius: 999px; }
+
+  output {
+    font-variant-numeric: tabular-nums;
+    font-size: 14px;
+    font-weight: 600;
+    color: #374151;
+    min-width: 6.2ch;
+    text-align: right;
+  }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="fan"></canvas>
+</div>
+
+<div class="panel">
+  <label for="speed">Speed</label>
+  <input id="speed" type="range" min="3" max="200" step="1" value="60" />
+  <output id="rpmOut" for="speed">60 rpm</output>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  const canvas = document.getElementById("fan");
+  const ctx    = canvas.getContext("2d");
+  const slider = document.getElementById("speed");
+  const out    = document.getElementById("rpmOut");
+
+  let size = 300;          // CSS pixel size of the (square) canvas
+  let dpr  = 1;
+  let rpm  = Number(slider.value);
+  let angle = 0;           // rotor angle in radians
+  let last = 0;            // timestamp of previous frame
+
+  /* ---------- sizing ---------- */
+
+  function resize() {
+    const rect = canvas.getBoundingClientRect();
+    dpr  = Math.min(window.devicePixelRatio || 1, 2);
+    size = Math.max(1, Math.round(rect.width));
+    canvas.width  = Math.round(size * dpr);
+    canvas.height = Math.round(size * dpr);
+  }
+
+  /* ---------- drawing ---------- */
+
+  function drawRotor(cx, cy, R, rot) {
+    const tipR = R * 0.80;
+    const hubR = R * 0.15;
+    const BLADES = 5;
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(rot);
+
+    for (let i = 0; i < BLADES; i++) {
+      ctx.save();
+      ctx.rotate((i * Math.PI * 2) / BLADES);
+
+      // Blade shading runs from root to tip
+      const g = ctx.createLinearGradient(0, -hubR, 0, -tipR);
+      g.addColorStop(0.00, "#eef3f8");
+      g.addColorStop(0.50, "#c2d0e0");
+      g.addColorStop(1.00, "#8ea4bd");
+
+      ctx.beginPath();
+      ctx.moveTo(0, -hubR * 0.9);
+      // leading edge sweeping out to the tip
+      ctx.quadraticCurveTo(-R * 0.30, -tipR * 0.55, -R * 0.13, -tipR);
+      // rounded tip
+      ctx.quadraticCurveTo(-R * 0.02, -tipR * 1.06,  R * 0.07, -tipR * 0.97);
+      // trailing edge back to the hub
+      ctx.quadraticCurveTo( R * 0.02, -tipR * 0.50,  R * 0.11, -hubR * 0.9);
+      ctx.closePath();
+
+      ctx.fillStyle = g;
+      ctx.fill();
+      ctx.lineWidth = Math.max(0.6, R * 0.004);
+      ctx.strokeStyle = "rgba(60, 80, 105, 0.35)";
+      ctx.stroke();
+
+      ctx.restore();
+    }
+
+    // Hub
+    const hg = ctx.createRadialGradient(-hubR * 0.35, -hubR * 0.35, hubR * 0.05, 0, 0, hubR * 1.15);
+    hg.addColorStop(0, "#7c8b9e");
+    hg.addColorStop(1, "#2c3644");
+
+    ctx.beginPath();
+    ctx.arc(0, 0, hubR, 0, Math.PI * 2);
+    ctx.fillStyle = hg;
+    ctx.fill();
+    ctx.lineWidth = Math.max(0.6, R * 0.004);
+    ctx.strokeStyle = "rgba(20, 30, 45, 0.5)";
+    ctx.stroke();
+
+    // Small marker so the rotation is visible even on the hub
+    ctx.beginPath();
+    ctx.arc(0, -hubR * 0.58, Math.max(1.2, hubR * 0.16), 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255, 255, 255, 0.8)";
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  function drawGrill(cx, cy, R) {
+    ctx.save();
+    ctx.translate(cx, cy);
+
+    // Concentric rings
+    const rings = [0.24, 0.36, 0.48, 0.60, 0.72, 0.84];
+    ctx.strokeStyle = "rgba(88, 104, 125, 0.55)";
+    ctx.lineWidth = Math.max(0.8, R * 0.006);
+    for (const f of rings) {
+      ctx.beginPath();
+      ctx.arc(0, 0, R * f, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // Radial spokes
+    const spokes = 36;
+    ctx.strokeStyle = "rgba(88, 104, 125, 0.32)";
+    ctx.lineWidth = Math.max(0.6, R * 0.004);
+    for (let i = 0; i < spokes; i++) {
+      const a = (i * Math.PI * 2) / spokes;
+      const c = Math.cos(a), s = Math.sin(a);
+      ctx.beginPath();
+      ctx.moveTo(c * R * 0.20, s * R * 0.20);
+      ctx.lineTo(c * R * 0.88, s * R * 0.88);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
+  function drawRim(cx, cy, R) {
+    const ringR = R * 0.93;
+    const lw    = R * 0.06;
+
+    // Soft drop shadow
+    ctx.save();
+    ctx.shadowColor   = "rgba(31, 41, 55, 0.18)";
+    ctx.shadowBlur    = R * 0.05;
+    ctx.shadowOffsetY = R * 0.012;
+    ctx.beginPath();
+    ctx.arc(cx, cy, ringR, 0, Math.PI * 2);
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = "#c9d4e0";
+    ctx.stroke();
+    ctx.restore();
+
+    // Metallic ring
+    const g = ctx.createLinearGradient(cx - ringR, cy - ringR, cx + ringR, cy + ringR);
+    g.addColorStop(0.00, "#f7fafc");
+    g.addColorStop(0.45, "#cdd8e4");
+    g.addColorStop(1.00, "#8fa0b3");
+
+    ctx.beginPath();
+    ctx.arc(cx, cy, ringR, 0, Math.PI * 2);
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = g;
+    ctx.stroke();
+
+    // Hairlines on both edges of the ring
+    ctx.lineWidth = Math.max(0.6, R * 0.005);
+    ctx.strokeStyle = "rgba(60, 75, 95, 0.35)";
+    ctx.beginPath();
+    ctx.arc(cx, cy, ringR - lw / 2, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.strokeStyle = "rgba(60, 75, 95, 0.22)";
+    ctx.beginPath();
+    ctx.arc(cx, cy, ringR + lw / 2, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  function draw() {
+    const w = size, h = size;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // White background
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, w, h);
+
+    const cx = w / 2;
+    const cy = h / 2;
+    const R  = (Math.min(w, h) / 2) * 0.92;
+    const innerR = R * 0.90;
+
+    // Slightly recessed interior
+    const bg = ctx.createRadialGradient(
+      cx - R * 0.18, cy - R * 0.22, R * 0.05,
+      cx, cy, innerR
+    );
+    bg.addColorStop(0, "#ffffff");
+    bg.addColorStop(1, "#e6ebf1");
+    ctx.beginPath();
+    ctx.arc(cx, cy, innerR, 0, Math.PI * 2);
+    ctx.fillStyle = bg;
+    ctx.fill();
+
+    // Rotor (clipped to the interior so blades never escape)
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, innerR, 0, Math.PI * 2);
+    ctx.clip();
+    drawRotor(cx, cy, R, angle);
+    ctx.restore();
+
+    // Static parts on top
+    drawGrill(cx, cy, R);
+    drawRim(cx, cy, R);
+  }
+
+  /* ---------- animation loop ---------- */
+
+  function frame(now) {
+    if (!last) last = now;
+    let dt = (now - last) / 1000;
+    last = now;
+    if (dt > 0.1) dt = 0.1;              // clamp after tab switches
+
+    // rpm -> revolutions per second -> radians per second
+    angle = (angle + (rpm / 60) * Math.PI * 2 * dt) % (Math.PI * 2);
+
+    draw();
+    requestAnimationFrame(frame);
+  }
+
+  /* ---------- controls ---------- */
+
+  function syncSpeed() {
+    rpm = Number(slider.value);
+    out.textContent = rpm + " rpm";
+  }
+
+  slider.addEventListener("input", syncSpeed);
+
+  window.addEventListener("resize", resize);
+  if (window.ResizeObserver) {
+    new ResizeObserver(resize).observe(canvas);
+  }
+
+  /* ---------- start ---------- */
+
+  resize();
+  syncSpeed();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

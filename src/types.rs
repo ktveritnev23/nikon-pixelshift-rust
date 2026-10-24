@@ -171,6 +171,9 @@ pub struct Shift {
     pub residual: f32,
     /// Fitting quality 0..1 (higher is better).
     pub confidence: f32,
+    /// Share of this frame's samples excluded by the motion mask, 0..1,
+    /// 0 when motion compensation is off or nothing was masked.
+    pub masked_pct: f32,
 }
 
 impl Shift {
@@ -181,6 +184,7 @@ impl Shift {
             rot: 0.0,
             residual: 0.0,
             confidence: 1.0,
+            masked_pct: 0.0,
         }
     }
 
@@ -191,6 +195,7 @@ impl Shift {
             rot,
             residual: 0.0,
             confidence: 1.0,
+            masked_pct: 0.0,
         }
     }
 
@@ -201,6 +206,17 @@ impl Shift {
         let rx = (x - cx) * cos - (y - cy) * sin;
         let ry = (x - cx) * sin + (y - cy) * cos;
         (cx + rx + self.dx, cy + ry + self.dy)
+    }
+
+    /// Inverse of [`Shift::map`]: the frame pixel seeing the scene point at
+    /// reference coordinates (x, y).
+    pub fn inverse_map(&self, x: f64, y: f64, cx: f64, cy: f64) -> (f64, f64) {
+        let (sin, cos) = self.rot.sin_cos();
+        let px = x - cx - self.dx;
+        let py = y - cy - self.dy;
+        let rx = px * cos + py * sin;
+        let ry = -px * sin + py * cos;
+        (cx + rx, cy + ry)
     }
 
     pub fn is_identity(&self) -> bool {
@@ -275,6 +291,63 @@ impl ShiftGrid {
     }
 }
 
+/// Settings of the motion compensation (ghost suppression) pass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MotionParams {
+    pub enabled: bool,
+    /// Sensitivity multiplier: values above 1 mask more (lower threshold),
+    /// below 1 mask less. The base threshold is tuned so that 1.0 keeps the
+    /// false positive rate near zero on static tripod series.
+    pub sensitivity: f32,
+}
+
+impl Default for MotionParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sensitivity: 1.0,
+        }
+    }
+}
+
+/// Per frame motion mask: a coarse boolean grid over the frame, one cell per
+/// MOTION block of sensor pixels. A masked cell means "this frame disagrees
+/// with the reference here, its samples must not be merged". The reference
+/// frame itself is never masked, so fully masked regions fall back to its own
+/// (demosaiced) samples instead of ghosting.
+#[derive(Clone, Debug)]
+pub struct MotionMask {
+    /// Grid cell edge in sensor pixels.
+    pub step: usize,
+    pub cols: usize,
+    pub rows: usize,
+    /// One byte per cell, 0 = keep, 1 = blocked.
+    pub blocked: Vec<u8>,
+}
+
+impl MotionMask {
+    /// True when the sensor pixel (x, y) belongs to a masked cell.
+    #[inline]
+    pub fn blocked_at(&self, x: usize, y: usize) -> bool {
+        let cx = (x / self.step).min(self.cols - 1);
+        let cy = (y / self.step).min(self.rows - 1);
+        self.blocked[cy * self.cols + cx] != 0
+    }
+
+    /// Share of masked cells, 0..1.
+    pub fn masked_fraction(&self) -> f32 {
+        if self.blocked.is_empty() {
+            return 0.0;
+        }
+        self.blocked.iter().filter(|&&v| v != 0).count() as f32 / self.blocked.len() as f32
+    }
+
+    /// True when no cell is masked (the mask can be dropped).
+    pub fn is_empty(&self) -> bool {
+        self.blocked.iter().all(|&v| v == 0)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MergeParams {
     /// Output grid density: 1 = sensor resolution, 2 = double resolution on
@@ -293,6 +366,12 @@ pub struct MergeParams {
     pub denoise: bool,
     /// Optional residual correction grid per frame (same order as `shifts`).
     pub grids: Vec<Option<ShiftGrid>>,
+    /// Motion compensation settings; masks are computed from these by the
+    /// pipeline and land in `masks` unless they are supplied directly.
+    pub motion: MotionParams,
+    /// Optional per frame motion mask (same order as `shifts`, None or empty
+    /// = keep every sample). The reference frame's mask is ignored.
+    pub masks: Vec<Option<MotionMask>>,
     /// Strength of the reconstruction-kernel compensation (deconvolution) applied
     /// to the merged planes, 0.0 = pure normalised splatting (soft), 1.0 = full
     /// compensation of the splat kernel. Compensating keeps the linear data
@@ -311,6 +390,8 @@ impl Default for MergeParams {
             crop_uncovered: false,
             denoise: true,
             grids: Vec::new(),
+            motion: MotionParams::default(),
+            masks: Vec::new(),
             // Measured on the four reference series: compensating the
             // reconstruction kernel raises the high frequency energy from 0.44
             // to 0.57 of the NX Studio result on series 106 (0.73 -> 0.99 on
@@ -331,6 +412,9 @@ pub struct MergeStats {
     pub filled_pixels: usize,
     pub frames: usize,
     pub elapsed_ms: u128,
+    /// Share of masked samples per input frame, 0..1 (empty when motion
+    /// compensation is off). Aligned with the MergeParams::shifts order.
+    pub masked_pct: Vec<f32>,
 }
 
 /// Linear RGB result of the merge, in camera native units (black subtracted,

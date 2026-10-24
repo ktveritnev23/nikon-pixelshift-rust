@@ -352,7 +352,15 @@ pub fn estimate_shifts(frames: &[RawFrame], align: bool) -> Result<Vec<Shift>> {
 }
 
 pub fn merge_frames(frames: &[RawFrame], params: &MergeParams) -> Result<MergeResult> {
-    guarded("merge::merge (WP2)", || crate::merge::merge(frames, params)).context("merging frames")
+    // Motion masks are derived from the aligned frames unless the caller
+    // supplied them (tests do). Computed here, both the CLI and the GUI
+    // paths get them.
+    let mut params = params.clone();
+    if params.motion.enabled && params.align && params.masks.is_empty() && frames.len() > 1 {
+        let shifts = crate::merge::applied_shifts(frames, &params)?;
+        params.masks = crate::motion::masks(frames, &shifts, &params.motion);
+    }
+    guarded("merge::merge (WP2)", || crate::merge::merge(frames, &params)).context("merging frames")
 }
 
 /// Apply the lens distortion correction of the current options.

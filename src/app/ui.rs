@@ -294,7 +294,7 @@ fn frames_panel(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
     let mut select = None;
     egui::Grid::new("pixelshift-frames")
         .striped(true)
-        .num_columns(7)
+        .num_columns(8)
         .show(ui, |ui| {
             ui.label(egui::RichText::new("#").strong());
             ui.label(egui::RichText::new(lang.t("file", "файл")).strong());
@@ -303,6 +303,7 @@ fn frames_panel(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
             ui.label(egui::RichText::new("rot \"").strong());
             ui.label(egui::RichText::new("rms").strong());
             ui.label(egui::RichText::new("conf").strong());
+            ui.label(egui::RichText::new(lang.t("mask", "маска")).strong());
             ui.end_row();
             for (index, frame) in frames.iter().enumerate() {
                 let shift = shifts.get(index).copied().unwrap_or_default();
@@ -322,6 +323,11 @@ fn frames_panel(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
                     "-".to_string()
                 });
                 ui.label(format!("{:.2}", shift.confidence));
+                ui.label(if shift.masked_pct > 0.0 {
+                    format!("{:.1}%", shift.masked_pct * 100.0)
+                } else {
+                    "-".to_string()
+                });
                 ui.end_row();
             }
         });
@@ -403,6 +409,18 @@ fn options_panel(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label(lang.t("deconvolve", "деконволюция"));
         ui.add(egui::Slider::new(&mut state.options.deconvolve, 0.0..=2.0));
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(
+            &mut state.options.motion_enabled,
+            lang.t("motion compensation", "компенсация движения"),
+        );
+        if state.options.motion_enabled {
+            ui.label(lang.t("sensitivity", "чувствительность"));
+            ui.add(
+                egui::Slider::new(&mut state.options.motion_sensitivity, 0.25..=4.0).fixed_decimals(2),
+            );
+        }
     });
     ui.horizontal(|ui| {
         ui.label(lang.t("Distortion k1", "Дисторсия k1"));

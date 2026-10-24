@@ -65,6 +65,37 @@ keep the sensor grid and gain full colour resolution per pixel instead.
   per-colour interpolation is only needed to fill pixels whose coverage is
   incomplete (real, imperfect shifts, image borders).
 
+## Motion compensation (src/motion.rs)
+
+Opt-in (`MergeParams::motion`, CLI `--motion [--motion-sensitivity F]`, GUI
+checkbox + slider). After the rigid alignment, every non-reference frame is
+resampled through its Shift onto the CFA phase invariant lattice (the same
+`luma_plane` the alignment uses) with the six-tap Lanczos sampler; the
+difference against the reference is accumulated per 32x32 sensor px block and
+compared to a locally median block energy (7x7 block window). Motion occupies
+a minority of blocks, so the median estimates the noise + interpolation floor;
+a block above threshold x floor is moving. Isolated single blocks are dropped
+as noise spikes, the mask is dilated by one block, and the reference frame is
+never masked - fully masked regions fall back to its own (demosaiced) samples,
+so a moving object stays sharp instead of averaging into ghosts.
+
+Measured on the 109NZ6_3 experiment set (9 x 32 frames, Z6 III):
+- tripod static series: masks 2-4 % of blocks, quality metrics unchanged
+  within noise on one series; the other carries a bright clipped region where
+  our merge differs from NX Studio with or without masks (global metrics on
+  that scene swing several dB with the validation window placement).
+- fan at 50 rpm: in the fan region the masked merge is ~25 % closer to the
+  reference-time single frame than the plain merge, the background is bit
+  identical to the plain merge, and the NX Studio reference ghosts with a 3-6x
+  larger deviation from the single frame.
+- handheld IBIS series: the rigid aligner itself fails (inter-frame shifts of
+  5-22 px exceed its search design, residuals up to 9 px) - large-motion
+  alignment is the prerequisite before motion compensation can help there.
+
+The saturation guard treats blocks whose luma is within 2 % of the block-sum
+maximum as no data: clipped blocks disagree nonlinearly and dwarf any
+threshold.
+
 ## Output format decisions (current)
 
 Layout (all DNG flavors): the main image is **IFD0** (`NewSubfileType = 0`), the

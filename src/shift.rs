@@ -66,15 +66,15 @@ const ROT_GAIN: f64 = 0.8;
 const MIN_ENERGY: f64 = 0.05;
 
 /// Single channel f32 plane with clamped Catmull-Rom sampling.
-struct Plane {
-    w: usize,
-    h: usize,
-    data: Vec<f32>,
+pub(crate) struct Plane {
+    pub(crate) w: usize,
+    pub(crate) h: usize,
+    pub(crate) data: Vec<f32>,
 }
 
 impl Plane {
     #[inline]
-    fn at(&self, x: i64, y: i64) -> f32 {
+    pub(crate) fn at(&self, x: i64, y: i64) -> f32 {
         let xi = x.clamp(0, self.w as i64 - 1) as usize;
         let yi = y.clamp(0, self.h as i64 - 1) as usize;
         self.data[yi * self.w + xi]
@@ -87,12 +87,12 @@ impl Plane {
 /// the weights are built once per iteration instead of per sample. Cubic
 /// (Catmull-Rom) interpolation would leave a 0.01 .. 0.02 px interpolation bias,
 /// six taps bring it below 0.002 px.
-struct Taps {
+pub(crate) struct Taps {
     off: [i64; 6],
     w: [f32; 6],
 }
 
-fn taps(frac: f64) -> Taps {
+pub(crate) fn taps(frac: f64) -> Taps {
     let mut w = [0.0f32; 6];
     let mut sum = 0.0f64;
     for (k, wv) in w.iter_mut().enumerate() {
@@ -127,7 +127,7 @@ fn lanczos3(t: f64) -> f64 {
 }
 
 #[inline]
-fn sample_taps(p: &Plane, base_x: i64, base_y: i64, tx: &Taps, ty: &Taps) -> f32 {
+pub(crate) fn sample_taps(p: &Plane, base_x: i64, base_y: i64, tx: &Taps, ty: &Taps) -> f32 {
     let mut acc = 0.0f32;
     for j in 0..6 {
         let y = base_y + ty.off[j];
@@ -229,6 +229,7 @@ fn compose(prev: Shift, step: Shift) -> Shift {
         rot,
         residual: prev.residual.max(step.residual),
         confidence: 0.5 * step.confidence * prev.confidence.max(0.5),
+        masked_pct: 0.0,
     }
 }
 
@@ -380,6 +381,7 @@ fn measure(preps: &[CropPrep], frame: &RawFrame, width: usize, height: usize) ->
                 rot: 0.0,
                 residual: 0.0,
                 confidence: 0.0,
+                masked_pct: 0.0,
             },
             None,
             0.0,
@@ -529,6 +531,7 @@ fn fit_rigid(ests: &[WindowEst], cx: f64, cy: f64) -> Measurement {
         rot,
         residual: rms as f32,
         confidence: conf,
+        masked_pct: 0.0,
     };
     (shift, build_grid(ests, &keep, model, cx, cy), ncc)
 }
@@ -735,7 +738,7 @@ fn solve3(m: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
 /// CFA phase invariant working plane: each value is the sum of one 2x2 sensor
 /// block, black subtracted and low passed. The rectangle is in lattice
 /// coordinates.
-fn luma_plane(frame: &RawFrame, rect: Rect) -> Plane {
+pub(crate) fn luma_plane(frame: &RawFrame, rect: Rect) -> Plane {
     let w = frame.width;
     let black = frame.black_for(Color::R) as f32
         + 2.0 * frame.black_for(Color::G) as f32

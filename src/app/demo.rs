@@ -273,6 +273,7 @@ pub fn result(scale: u32, frames: &[RawFrame]) -> MergeResult {
             filled_pixels: 0,
             frames: frames.len(),
             elapsed_ms: 1,
+            masked_pct: vec![0.0; frames.len()],
         },
     }
 }

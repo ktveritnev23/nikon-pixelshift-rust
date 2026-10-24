@@ -8,6 +8,7 @@ pub mod types;
 pub mod rawio;
 pub mod shift;
 pub mod merge;
+pub mod motion;
 pub mod distort;
 pub mod fit;
 pub mod write;

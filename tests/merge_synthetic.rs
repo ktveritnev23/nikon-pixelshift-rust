@@ -7,8 +7,9 @@
 //! weight normalisation.
 
 use pixelshift::merge;
+use pixelshift::motion;
 use pixelshift::shift;
-use pixelshift::types::{Cfa, DngMeta, MergeParams, MergeResult, RawFrame, Shift, WriteOpts};
+use pixelshift::types::{Cfa, DngMeta, MergeParams, MergeResult, MotionParams, RawFrame, Shift, WriteOpts};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -1209,4 +1210,187 @@ fn deconvolve_zero_is_the_previous_behaviour() {
     for c in 0..3 {
         assert_eq!(a.planes[c], b.planes[c], "channel {c} differs with deconvolve >= 0 skipped");
     }
+}
+
+/// Scene with a bright square travelling between frames on top of the static
+/// [`Scene`]: `t` is the capture time (0 = the reference frame).
+fn moving_scene_rgb(x: f64, y: f64, t: f64) -> [f64; 3] {
+    let mut rgb = Scene.rgb(x, y);
+    let (ox, oy) = (50.0 + 46.0 * t, 46.0 + 30.0 * t);
+    let half = 16.0;
+    let dx = (x - ox).abs();
+    let dy = (y - oy).abs();
+    if dx < half && dy < half {
+        let edge = 1.0 - ((dx.max(dy) - (half - 2.0)) / 2.0).clamp(0.0, 1.0);
+        for c in 0..3 {
+            rgb[c] = (rgb[c] * (1.0 - 0.85 * edge) + 0.95 * 0.85 * edge).clamp(0.02, 0.97);
+        }
+    }
+    rgb
+}
+
+/// Render one frame of the moving-object scene at capture time t.
+fn render_moving(
+    w: usize,
+    h: usize,
+    shift: (f64, f64),
+    t: f64,
+    sigma: f64,
+    seed: u64,
+) -> RawFrame {
+    let cfa = Cfa::from_pattern_str("RGGB").expect("RGGB");
+    let mut rng = Rng::new(seed);
+    let mut data = vec![0u16; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let c = cfa.0[y & 1][x & 1];
+            let v = moving_scene_rgb(x as f64 + shift.0, y as f64 + shift.1, t)[c.idx()] * span()
+                + BLACK as f64
+                + sigma * rng.normal();
+            data[y * w + x] = v.round().clamp(0.0, WHITE as f64) as u16;
+        }
+    }
+    RawFrame {
+        path: PathBuf::from("synthetic"),
+        width: w,
+        height: h,
+        data,
+        cfa,
+        black: BLACK,
+        cblack: [0; 4],
+        white: WHITE,
+        wb: [1.0, 1.0, 1.0, 1.0],
+        cam_xyz: [[0.0; 3]; 4],
+        rgb_cam: [[0.0; 3]; 4],
+        iso: 100.0,
+        shutter: 1.0 / 125.0,
+        aperture: 5.6,
+        focal: 50.0,
+        lens_make: String::new(),
+        lens_model: String::new(),
+        focal_35mm: 50,
+        max_aperture: 1.8,
+        lens_min_focal: 0.0,
+        lens_max_focal: 0.0,
+        lens_min_fnum: 0.0,
+        lens_max_fnum: 0.0,
+        lens_serial: String::new(),
+        body_serial: String::new(),
+        make: String::new(),
+        model: String::new(),
+        timestamp: String::new(),
+        index: 0,
+    }
+}
+
+/// RMS error of a merged result against the reference-time scene, inside a
+/// rectangle (sensor coordinates scaled by k inside).
+fn error_in_rect(merged: &MergeResult, x0: usize, y0: usize, x1: usize, y1: usize) -> f64 {
+    let k = merged.scale as usize;
+    let mut sse = 0.0f64;
+    let mut n = 0.0f64;
+    for y in (y0 * k)..(y1 * k).min(merged.height) {
+        for x in (x0 * k)..(x1 * k).min(merged.width) {
+            let truth = moving_scene_rgb(x as f64 / k as f64, y as f64 / k as f64, 0.0);
+            for c in 0..3 {
+                let got = merged.planes[c][y * merged.width + x] as f64;
+                let want = truth[c] * span();
+                sse += (got - want) * (got - want);
+                n += 1.0;
+            }
+        }
+    }
+    (sse / n.max(1.0)).sqrt()
+}
+
+#[test]
+fn motion_mask_removes_ghosts_of_a_moving_object() {
+    // Large enough that the 32 px mask blocks (plus dilation) stay well
+    // inside the moving band and leave a genuinely static area to check.
+    let (w, h) = (512usize, 384usize);
+    let positions = half_lattice();
+    let shifts: Vec<Shift> = positions.iter().map(|p| Shift::new(p.0, p.1)).collect();
+    let frames: Vec<RawFrame> = positions
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let t = i as f64 / (positions.len() - 1) as f64;
+            render_moving(w, h, *p, t, 4.0, 500 + i as u64)
+        })
+        .collect();
+
+    // Plain merge: the moving square is averaged at all of its positions.
+    let plain = merge::merge(&frames, &params(1, shifts.clone())).expect("plain merge");
+
+    // Masked merge: masks from the same machinery the pipeline uses.
+    let motion = MotionParams {
+        enabled: true,
+        sensitivity: 1.0,
+    };
+    let masks = motion::masks(&frames, &shifts, &motion);
+    let masked_count = masks.iter().filter(|m| m.is_some()).count();
+    assert!(masked_count >= positions.len() - 2, "most frames must carry a mask");
+    let mut p = params(1, shifts.clone());
+    p.motion = motion;
+    p.masks = masks;
+    let masked = merge::merge(&frames, &p).expect("masked merge");
+
+    // The square sweeps (50, 46) .. (96, 76) plus its half edge: that band
+    // must be dramatically closer to the reference-time scene when masked.
+    let ghost_rms = error_in_rect(&plain, 30, 26, 118, 96);
+    let masked_rms = error_in_rect(&masked, 30, 26, 118, 96);
+    println!("moving band: ghost rms {ghost_rms:.1}, masked rms {masked_rms:.1}");
+    assert!(
+        masked_rms * 2.0 < ghost_rms,
+        "the mask must remove the ghosts: rms {ghost_rms:.1} vs {masked_rms:.1}"
+    );
+
+    // The static area keeps the full quality of the base algorithm.
+    let static_ghost = error_in_rect(&plain, 300, 150, 505, 375);
+    let static_masked = error_in_rect(&masked, 300, 150, 505, 375);
+    println!("static area: plain {static_ghost:.1}, masked {static_masked:.1}");
+    assert!(
+        static_masked <= static_ghost * 1.1 + 1.0,
+        "the static area lost quality: {static_ghost:.1} -> {static_masked:.1}"
+    );
+
+    // Per frame masked share is reported and the reference frame is zero.
+    let stats = &masked.stats;
+    assert_eq!(stats.masked_pct.len(), frames.len());
+    assert_eq!(stats.masked_pct[0], 0.0);
+    assert!(stats.masked_pct[1..].iter().any(|&v| v > 0.0));
+}
+
+#[test]
+fn motion_masks_on_a_static_series_are_empty() {
+    let (w, h) = (256usize, 192usize);
+    let positions = half_lattice();
+    let shifts: Vec<Shift> = positions.iter().map(|p| Shift::new(p.0, p.1)).collect();
+    let frames: Vec<RawFrame> = positions
+        .iter()
+        .enumerate()
+        .map(|(i, p)| render(&Scene, w, h, *p, 4.0, 700 + i as u64))
+        .collect();
+    let motion = MotionParams {
+        enabled: true,
+        sensitivity: 1.0,
+    };
+    let masks = motion::masks(&frames, &shifts, &motion);
+    assert!(
+        masks.iter().all(|m| m.is_none()),
+        "a static series must not be masked"
+    );
+
+    let plain = merge::merge(&frames, &params(1, shifts.clone())).expect("plain merge");
+    let mut p = params(1, shifts);
+    p.motion = motion;
+    p.masks = masks;
+    let masked = merge::merge(&frames, &p).expect("masked merge");
+    let (_, psnr_plain) = error_stats(&plain, &Scene, 8);
+    let (_, psnr_masked) = error_stats(&masked, &Scene, 8);
+    println!("static series psnr: plain {psnr_plain:.2}, masked {psnr_masked:.2} dB");
+    assert!(
+        (psnr_plain - psnr_masked).abs() < 1.0,
+        "masks changed a static merge: {psnr_plain:.2} -> {psnr_masked:.2} dB"
+    );
 }

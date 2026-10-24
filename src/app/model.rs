@@ -4,7 +4,7 @@
 
 use crate::app::pipeline::{self, ResultInfo, SeriesInfo};
 use crate::app::worker::{Event, Mode};
-use crate::types::{MergeParams, MergeStats, PreviewImage, Shift};
+use crate::types::{MergeParams, MergeStats, MotionParams, PreviewImage, Shift};
 use crate::write::DngFlavor;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -120,6 +120,10 @@ pub struct EditOptions {
     pub tiff_render: bool,
     /// Strength of the merge deconvolution, see `MergeParams::deconvolve`.
     pub deconvolve: f32,
+    /// Mask scene motion out of the merge, see `MergeParams::motion`.
+    pub motion_enabled: bool,
+    /// Motion detection sensitivity (1.0 = the tuned default).
+    pub motion_sensitivity: f32,
     /// Lens distortion correction applied to the merged result (preview and
     /// export alike).
     pub distort: crate::distort::Distortion,
@@ -137,6 +141,8 @@ impl Default for EditOptions {
             flavor: DngFlavor::LinearRaw,
             tiff_render: true,
             deconvolve: MergeParams::default().deconvolve,
+            motion_enabled: false,
+            motion_sensitivity: 1.0,
             distort: crate::distort::Distortion::IDENTITY,
             also_1x: false,
             align: true,
@@ -152,6 +158,10 @@ impl EditOptions {
             align: self.align,
             shifts,
             deconvolve: self.deconvolve,
+            motion: MotionParams {
+                enabled: self.motion_enabled,
+                sensitivity: self.motion_sensitivity,
+            },
             ..MergeParams::default()
         }
     }
@@ -722,16 +732,29 @@ impl GuiState {
                 }
             }
             Event::Merged { index, info, stats } => {
+                let motion = if stats.masked_pct.is_empty() {
+                    String::new()
+                } else {
+                    let worst = stats.masked_pct.iter().cloned().fold(0.0f32, f32::max);
+                    format!(", motion masked up to {:.1} %", worst * 100.0)
+                };
                 self.push_log(format!(
-                    "merged {}x{} at scale {}, {:.2} MP, {:.2} samples/channel",
+                    "merged {}x{} at scale {}, {:.2} MP, {:.2} samples/channel{}",
                     info.width,
                     info.height,
                     info.scale,
                     info.megapixels(),
-                    stats.mean_samples_per_channel
+                    stats.mean_samples_per_channel,
+                    motion
                 ));
                 if let Some(series) = self.series.get_mut(index) {
                     series.result = Some(info);
+                    if stats.masked_pct.len() == series.shifts.len() {
+                        for (shift, masked) in series.shifts.iter_mut().zip(stats.masked_pct.iter())
+                        {
+                            shift.masked_pct = *masked;
+                        }
+                    }
                     series.stats = Some(stats);
                     series.loaded = true;
                 }

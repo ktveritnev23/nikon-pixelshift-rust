@@ -22,8 +22,8 @@
 //! not depend on the frame count or on the scale.
 
 use crate::types::{
-    Cfa, Color, MergeParams, MergeResult, MergeStats, PreviewImage, RawFrame, Shift, ShiftGrid,
-    CHANNELS,
+    Cfa, Color, MergeParams, MergeResult, MergeStats, MotionMask, PreviewImage, RawFrame, Shift,
+    ShiftGrid, CHANNELS,
 };
 use anyhow::{bail, Result};
 use rayon::prelude::*;
@@ -92,6 +92,9 @@ struct FrameView<'a> {
     scale: f64,
     /// Local correction on top of the rigid model, in sensor pixels.
     grid: Option<ShiftGrid>,
+    /// Motion mask: samples in blocked cells are not merged (None for the
+    /// reference frame and unmasked frames).
+    mask: Option<&'a MotionMask>,
     black: [f32; CHANNELS],
 }
 
@@ -151,6 +154,9 @@ pub fn merge(frames: &[RawFrame], params: &MergeParams) -> Result<MergeResult> {
                 } else {
                     None
                 },
+                // The reference frame is never masked: in fully masked
+                // regions the result falls back to its own samples.
+                mask: if i == 0 { None } else { params.masks.get(i).and_then(|m| m.as_ref()) },
                 black: [
                     f.black_for(Color::R) as f32,
                     f.black_for(Color::G) as f32,
@@ -159,6 +165,23 @@ pub fn merge(frames: &[RawFrame], params: &MergeParams) -> Result<MergeResult> {
             }
         })
         .collect();
+
+    // Per input frame masked share, aligned with params.shifts (0 for the
+    // reference frame, unused frames included for stable indexing).
+    let stats_masked: Vec<f32> = if params.masks.is_empty() {
+        Vec::new()
+    } else {
+        (0..shifts.len())
+            .map(|i| {
+                params
+                    .masks
+                    .get(i)
+                    .and_then(|m| m.as_ref())
+                    .map(|m| m.masked_fraction())
+                    .unwrap_or(0.0)
+            })
+            .collect()
+    };
 
     let band_count = oh.div_ceil(BAND_ROWS);
     let bands: Vec<BandOut> = (0..band_count)
@@ -312,15 +335,18 @@ pub fn merge(frames: &[RawFrame], params: &MergeParams) -> Result<MergeResult> {
         filled_pixels,
         frames: used.len(),
         elapsed_ms: started.elapsed().as_millis(),
+        masked_pct: stats_masked.clone(),
     };
     let out_shifts: Vec<Shift> = shifts
         .iter()
-        .map(|s| Shift {
+        .enumerate()
+        .map(|(i, s)| Shift {
             dx: if params.align { s.dx } else { 0.0 },
             dy: if params.align { s.dy } else { 0.0 },
             rot: if params.align { s.rot } else { 0.0 },
             residual: s.residual,
             confidence: s.confidence,
+            masked_pct: stats_masked.get(i).copied().unwrap_or(0.0),
         })
         .collect();
     Ok(MergeResult {
@@ -354,7 +380,7 @@ fn first_pixel_guard(frames: &[RawFrame]) -> Result<()> {
     Ok(())
 }
 
-fn applied_shifts(frames: &[RawFrame], params: &MergeParams) -> Result<Vec<Shift>> {
+pub(crate) fn applied_shifts(frames: &[RawFrame], params: &MergeParams) -> Result<Vec<Shift>> {
     // Without alignment every frame lands on the same lattice, two of the three
     // channels get no samples at all and nearly every pixel is reported as
     // filled: that is the expected degenerate result, not a bug.
@@ -424,6 +450,11 @@ fn run_band(
             let c_odd = f.cfa.0[y & 1][1];
             let base = y * f.w;
             for x in 0..f.w {
+                if let Some(m) = f.mask {
+                    if m.blocked_at(x, y) {
+                        continue;
+                    }
+                }
                 let odd = x & 1 == 1;
                 let c = if odd { c_odd } else { c_even };
                 let ci = c.idx();
