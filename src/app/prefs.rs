@@ -32,12 +32,16 @@ pub enum FontMode {
     Builtin,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiPrefs {
     pub lang: Lang,
     pub theme: ThemeMode,
     pub font: FontMode,
+    /// Name of the active style from the styles directory; None = the
+    /// built-in look for the theme.
+    #[serde(default)]
+    pub style_file: Option<String>,
 }
 
 impl Default for UiPrefs {
@@ -46,6 +50,7 @@ impl Default for UiPrefs {
             lang: Lang::detect(),
             theme: ThemeMode::System,
             font: FontMode::System,
+            style_file: None,
         }
     }
 }
@@ -68,6 +73,30 @@ impl UiPrefs {
                     style.visuals.weak_text_alpha.max(LIGHT_WEAK_TEXT_ALPHA);
             }
         });
+
+        // A user style file overrides the built-in look: the file is applied
+        // to BOTH stored styles (the theme preference above decides which is
+        // active, and a runtime system-theme switch must not drop the file).
+        // Canvas colours always come from the file's own palette.
+        let chosen = self.style_file.as_ref().and_then(|name| {
+            super::style::styles_dir()
+                .map(|dir| super::style::load_dir(&dir))
+                .unwrap_or_default()
+                .into_iter()
+                .find(|s| &s.name == name)
+        });
+        match chosen {
+            Some(style) => {
+                super::style::set_active(style.clone());
+                ctx.all_styles_mut(|s| s.visuals = style.visuals.clone());
+            }
+            None => {
+                super::style::set_active(match self.theme {
+                    ThemeMode::Light => super::style::StyleFile::builtin_light(),
+                    _ => super::style::StyleFile::builtin_dark(),
+                });
+            }
+        }
 
         let mut definitions = egui::FontDefinitions::default();
         if self.font == FontMode::System {
@@ -128,7 +157,115 @@ impl UiPrefs {
                 .selectable_value(&mut self.font, FontMode::Builtin, lang.t("Built-in", "Встроенный"))
                 .changed();
         });
+        ui.separator();
+        ui.label(
+            egui::RichText::new(lang.t(
+                "Style files are editable JSON in the styles directory; a loaded style overrides the built-in look",
+                "Файлы стилей — редактируемый JSON в каталоге styles; загруженный стиль замещает встроенный вид",
+            ))
+            .small()
+            .weak(),
+        );
+        ui.horizontal(|ui| {
+            ui.label(lang.t("Style", "Стиль"));
+            // Built-ins first, then the loaded style files.
+            let mut selected_name = self.style_file.clone().unwrap_or_else(|| match self.theme {
+                ThemeMode::Light => "Light (built-in)".to_string(),
+                _ => "Dark (built-in)".to_string(),
+            });
+            let dir = super::style::styles_dir();
+            let files = dir
+                .map(|d| super::style::load_dir(&d))
+                .unwrap_or_default();
+            let mut pick: Option<Option<String>> = None;
+            egui::ComboBox::from_id_salt("pixelshift-style")
+                .selected_text(selected_name.clone())
+                .show_ui(ui, |ui| {
+                    for name in ["Dark (built-in)", "Light (built-in)"] {
+                        if ui.selectable_label(selected_name == name, name).clicked() {
+                            pick = Some(None);
+                            selected_name = name.to_string();
+                        }
+                    }
+                    ui.separator();
+                    for file in &files {
+                        if ui
+                            .selectable_label(selected_name == file.name, &file.name)
+                            .clicked()
+                        {
+                            pick = Some(Some(file.name.clone()));
+                            selected_name = file.name.clone();
+                        }
+                    }
+                });
+            if let Some(value) = pick {
+                self.style_file = value;
+                changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .button(lang.t("Load style file...", "Загрузить стиль..."))
+                .clicked()
+            {
+                changed |= self.load_style_dialog();
+            }
+            if ui
+                .button(lang.t("Export current style...", "Экспортировать стиль..."))
+                .clicked()
+            {
+                self.export_style_dialog();
+            }
+        });
         changed
+    }
+
+    /// Copy a JSON style file into the styles directory and select it.
+    fn load_style_dialog(&mut self) -> bool {
+        let Some(source) = rfd::FileDialog::new()
+            .add_filter("style (json)", &["json"])
+            .pick_file()
+        else {
+            return false;
+        };
+        let Some(dir) = super::style::styles_dir() else {
+            return false;
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        let Ok(text) = std::fs::read_to_string(&source) else {
+            return false;
+        };
+        let Ok(style) = super::style::StyleFile::from_json(&text) else {
+            return false;
+        };
+        // Make the display name unique in the directory.
+        let stem = style.file_stem();
+        let mut path = dir.join(format!("{stem}.json"));
+        let mut n = 1;
+        while path.exists() {
+            n += 1;
+            path = dir.join(format!("{stem}-{n}.json"));
+            if n > 999 {
+                return false;
+            }
+        }
+        if style.save(&path).is_err() {
+            return false;
+        }
+        self.style_file = Some(style.name.clone());
+        true
+    }
+
+    /// Write the currently active style next to the user's documents.
+    fn export_style_dialog(&self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name("pixelshift-style.json")
+            .add_filter("style (json)", &["json"])
+            .save_file()
+        else {
+            return;
+        };
+        let _ = super::style::active().save(&path);
     }
 }
 
@@ -286,10 +423,17 @@ mod tests {
             lang: Lang::Ru,
             theme: ThemeMode::Dark,
             font: FontMode::Builtin,
+            style_file: Some("my-style".to_string()),
         };
         let text = ron::to_string(&prefs).unwrap();
-        assert!(text.contains("ru") && text.contains("dark") && text.contains("builtin"));
+        assert!(
+            text.contains("ru") && text.contains("dark") && text.contains("builtin"),
+            "{text}"
+        );
         assert_eq!(ron::from_str::<UiPrefs>(&text).unwrap(), prefs);
+        // A record written by an older build (no style_file) still loads.
+        let legacy: UiPrefs = ron::from_str("(lang:en,theme:light,font:system)").unwrap();
+        assert_eq!(legacy.style_file, None);
     }
 
     #[test]

@@ -1033,7 +1033,8 @@ fn canvas(state: &mut GuiState, cache: &mut PreviewCache, lang: Lang, ui: &mut e
     let viewport = ui.available_size();
     let (response, painter) = ui.allocate_painter(viewport, Sense::click_and_drag());
     let rect = response.rect;
-    painter.rect_filled(rect, 0.0, Color32::from_rgb(18, 18, 20));
+    let style = crate::app::style::active();
+    painter.rect_filled(rect, 0.0, Color32::from_rgb(style.canvas.background[0], style.canvas.background[1], style.canvas.background[2]));
 
     let Some(dims) = state.image_size() else {
         // Nothing to show yet: turn the whole canvas into a large
@@ -1041,11 +1042,11 @@ fn canvas(state: &mut GuiState, cache: &mut PreviewCache, lang: Lang, ui: &mut e
         let hovering = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
         let inner = rect.shrink2(egui::vec2(60.0, 50.0));
         let accent = if hovering {
-            Color32::from_rgb(120, 180, 250)
+            Color32::from_rgb(style.canvas.drop_accent[0], style.canvas.drop_accent[1], style.canvas.drop_accent[2])
         } else {
-            Color32::from_rgb(90, 90, 110)
+            Color32::from_rgb(style.canvas.drop_stroke[0], style.canvas.drop_stroke[1], style.canvas.drop_stroke[2])
         };
-        painter.rect_filled(inner, 12.0, Color32::from_rgb(26, 26, 30));
+        painter.rect_filled(inner, 12.0, Color32::from_rgb(style.canvas.drop_fill[0], style.canvas.drop_fill[1], style.canvas.drop_fill[2]));
         painter.rect_stroke(
             inner,
             12.0,
@@ -1065,7 +1066,11 @@ fn canvas(state: &mut GuiState, cache: &mut PreviewCache, lang: Lang, ui: &mut e
             egui::Align2::CENTER_CENTER,
             title,
             egui::FontId::proportional(22.0),
-            if hovering { accent } else { Color32::from_rgb(200, 200, 210) },
+            if hovering {
+                accent
+            } else {
+                Color32::from_rgb(style.canvas.drop_title[0], style.canvas.drop_title[1], style.canvas.drop_title[2])
+            },
         );
         painter.text(
             inner.center() + Vec2::new(0.0, 14.0),
@@ -1164,7 +1169,7 @@ fn canvas(state: &mut GuiState, cache: &mut PreviewCache, lang: Lang, ui: &mut e
             egui::Align2::RIGHT_TOP,
             lang.t("loading detail", "загрузка деталей"),
             egui::FontId::monospace(12.0),
-            Color32::from_rgb(230, 200, 120),
+            Color32::from_rgb(style.canvas.loading_text[0], style.canvas.loading_text[1], style.canvas.loading_text[2]),
         );
     }
 
@@ -1190,7 +1195,7 @@ fn canvas(state: &mut GuiState, cache: &mut PreviewCache, lang: Lang, ui: &mut e
         egui::Align2::LEFT_BOTTOM,
         label,
         egui::FontId::monospace(12.0),
-        Color32::from_rgb(180, 180, 190),
+        Color32::from_rgb(style.canvas.status_text[0], style.canvas.status_text[1], style.canvas.status_text[2]),
     );
 }
 
@@ -1213,17 +1218,22 @@ fn draw_grid(
     let to_screen = |x: f32, y: f32| -> egui::Pos2 {
         canvas.center() + Vec2::new((x - center[0]) * zoom, (y - center[1]) * zoom)
     };
-    let (weak, strong) = if dark {
-        (
-            Color32::from_white_alpha(60),
-            Color32::from_white_alpha(110),
-        )
-    } else {
-        (
-            Color32::from_black_alpha(45),
-            Color32::from_black_alpha(80),
-        )
-    };
+    let _ = dark;
+    let st = crate::app::style::active();
+    let (weak, strong) = (
+        Color32::from_rgba_unmultiplied(
+            st.canvas.grid_line[0],
+            st.canvas.grid_line[1],
+            st.canvas.grid_line[2],
+            st.canvas.grid_line[3],
+        ),
+        Color32::from_rgba_unmultiplied(
+            st.canvas.grid_center[0],
+            st.canvas.grid_center[1],
+            st.canvas.grid_center[2],
+            st.canvas.grid_center[3],
+        ),
+    );
     let mut step = 1.0f32;
     while step * zoom < 80.0 {
         step *= 2.0;
@@ -1287,7 +1297,13 @@ fn paint_slot(
         painter.rect_stroke(
             target,
             0.0,
-            egui::Stroke::new(1.0, Color32::from_rgb(90, 90, 120)),
+            egui::Stroke::new(
+                1.0,
+                {
+                    let st = crate::app::style::active();
+                    Color32::from_rgb(st.canvas.crop_outline[0], st.canvas.crop_outline[1], st.canvas.crop_outline[2])
+                },
+            ),
             egui::StrokeKind::Inside,
         );
     }

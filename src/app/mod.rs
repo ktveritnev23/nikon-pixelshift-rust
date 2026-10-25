@@ -6,6 +6,7 @@ pub mod model;
 pub mod pipeline;
 pub mod prefs;
 pub mod selftest;
+pub mod style;
 pub mod ui;
 pub mod worker;
 
@@ -126,7 +127,7 @@ impl PixelShiftApp {
             state.show_log = true;
         }
         let saved_prefs = load_prefs(cc.storage, &mut state);
-        let mut prefs = saved_prefs;
+        let mut prefs = saved_prefs.clone();
         if let Some(lang) = overrides.lang {
             prefs.lang = lang;
         }
@@ -136,9 +137,25 @@ impl PixelShiftApp {
         if let Some(font) = overrides.font {
             prefs.font = font;
         }
-        // Applied in the app creator, before the first egui pass: no light flash
-        // when the stored or requested theme is dark.
+        // Materialise the editable style files on first launch, then apply
+        // the theme/fonts/style. Both before the first egui pass: no light
+        // flash when the stored or requested theme is dark.
+        if let Some(dir) = style::styles_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            let written = style::ensure_builtin_files(&dir);
+            for path in written {
+                state.push_log(format!("style file created: {}", path.display()));
+            }
+        }
         prefs.install(&cc.egui_ctx);
+        if prefs.style_file.is_none() {
+            state.push_log(format!(
+                "styles directory: {}",
+                style::styles_dir()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|| "unavailable".to_string())
+            ));
+        }
         if let Some(warning) = prefs::take_font_warning() {
             state.push_log(warning);
         }
@@ -169,7 +186,7 @@ impl PixelShiftApp {
     /// Preferences as they should be written back: a value that only came from
     /// a command line flag is replaced by the stored one, so flags never stick.
     fn persisted_prefs(&self) -> UiPrefs {
-        let mut prefs = self.prefs;
+        let mut prefs = self.prefs.clone();
         if let Some(lang) = self.overrides.lang {
             if prefs.lang == lang {
                 prefs.lang = self.saved_prefs.lang;
