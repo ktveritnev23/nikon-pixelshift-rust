@@ -1,0 +1,6 @@
+# Build for the host CPU (AVX-512 on the development machine): the merge and
+# alignment kernels are scalar hot loops, native codegen alone was worth
+# ~5 % end to end. Remove this file (or replace native with x86-64-v3) when
+# shipping binaries to machines older than the build host.
+[build]
+rustflags = ["-C", "target-cpu=native"]

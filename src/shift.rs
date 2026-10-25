@@ -19,6 +19,49 @@
 use crate::types::{Color, RawFrame, Rect, Shift, ShiftGrid};
 use anyhow::{bail, Result};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+/// Cumulative per-phase work of one series estimate, in nanoseconds of
+/// thread time. Reported by PIXELSHIFT_DEBUG_SHIFT to attribute the
+/// alignment wall time; thread time, not wall time, because every phase
+/// runs inside a rayon pool.
+pub(crate) static TIMERS: Timers = Timers {
+    prep: AtomicU64::new(0),
+    global: AtomicU64::new(0),
+    candidate: AtomicU64::new(0),
+    rank_ncc: AtomicU64::new(0),
+    tgts: AtomicU64::new(0),
+    windows: AtomicU64::new(0),
+};
+
+#[allow(dead_code)]
+pub(crate) struct Timers {
+    /// Reference side prep: window planes, gradients, global pyramid.
+    prep: AtomicU64,
+    /// Whole-frame coarse plane + top peak search per frame.
+    global: AtomicU64,
+    /// Candidate coarse search + Gauss-Newton refine on the center window.
+    candidate: AtomicU64,
+    /// Field NCC ranking of one refined candidate.
+    rank_ncc: AtomicU64,
+    /// Target window planes of one frame.
+    tgts: AtomicU64,
+    /// 25-window coarse + refine + rigid fit.
+    windows: AtomicU64,
+}
+
+fn timers_report() -> String {
+    let ns = |t: &AtomicU64| t.load(AtomicOrdering::Relaxed) as f64 / 1e9;
+    format!(
+        "shift timers (thread s): prep {:.2}, global {:.2}, candidate {:.2}, rank_ncc {:.2}, tgts {:.2}, windows {:.2}",
+        ns(&TIMERS.prep),
+        ns(&TIMERS.global),
+        ns(&TIMERS.candidate),
+        ns(&TIMERS.rank_ncc),
+        ns(&TIMERS.tgts),
+        ns(&TIMERS.windows),
+    )
+}
 
 /// Integer search radius on the 2 px lattice around the global estimate (8
 /// sensor pixels).
@@ -151,6 +194,92 @@ pub(crate) fn sample_taps(p: &Plane, base_x: i64, base_y: i64, tx: &Taps, ty: &T
     acc
 }
 
+/// Six-tap sample of a tile that is known to sit inside the plane: the tap
+/// window (offsets -2..=3) is bounded by the caller, so no per-tap clamping
+/// runs. Falls back to the clamped sampler at the borders.
+#[inline]
+pub(crate) fn sample_taps_inner(p: &Plane, base_x: i64, base_y: i64, tx: &Taps, ty: &Taps) -> f32 {
+    if base_x >= 2 && base_x + 3 < p.w as i64 && base_y >= 2 && base_y + 3 < p.h as i64 {
+        let w = p.w;
+        let row0 = (base_y - 2) as usize * w + (base_x - 2) as usize;
+        let mut acc = 0.0f32;
+        for j in 0..6 {
+            let row = &p.data[row0 + j as usize * w..row0 + j as usize * w + 6];
+            let mut r = 0.0f32;
+            for i in 0..6 {
+                r += tx.w[i] * row[i];
+            }
+            acc += ty.w[j] * r;
+        }
+        acc
+    } else {
+        sample_taps(p, base_x, base_y, tx, ty)
+    }
+}
+
+/// Plane value and both gradient samples for one Gauss-Newton sample,
+/// bit exact against three `sample_taps` calls on the plane and its gradient
+/// planes. The CropPrep gradients are central differences of the plane, so
+/// the three 6x6 tap windows are sub-windows of one 8x8 tile (offsets
+/// -3..=4 on both axes): one contiguous tile read replaces 3x36 clamped
+/// loads, which is what dominates the refinement loop.
+#[inline]
+fn sample_grad_taps(
+    p: &Plane,
+    gx: &Plane,
+    gy: &Plane,
+    base_x: i64,
+    base_y: i64,
+    tx: &Taps,
+    ty: &Taps,
+) -> (f32, f32, f32) {
+    let (w, h) = (p.w as i64, p.h as i64);
+    if gx.w == p.w
+        && gx.h == p.h
+        && gy.w == p.w
+        && gy.h == p.h
+        && base_x >= 3
+        && base_x + 4 < w
+        && base_y >= 3
+        && base_y + 4 < h
+    {
+        let mut tile = [0.0f32; 64];
+        let stride = p.w;
+        let bx = (base_x - 3) as usize;
+        let by = (base_y - 3) as usize;
+        for (r, trow) in tile.chunks_mut(8).enumerate() {
+            let src = (by + r) * stride + bx;
+            trow.copy_from_slice(&p.data[src..src + 8]);
+        }
+        let (mut a, mut sx, mut sy) = (0.0f32, 0.0f32, 0.0f32);
+        for j in 0..6 {
+            // Tap row j (offset -2..=3) is tile row j+1; the vertical
+            // gradient tap row j needs the tile rows j and j+2.
+            let row = (j + 1) * 8;
+            let mut ra = 0.0f32;
+            let mut rgx = 0.0f32;
+            let mut rgy = 0.0f32;
+            for i in 0..6 {
+                let wv = tx.w[i];
+                let c = i + 1;
+                ra += wv * tile[row + c];
+                rgx += wv * (0.5 * (tile[row + c + 1] - tile[row + c - 1]));
+                rgy += wv * (0.5 * (tile[row + 8 + c] - tile[row - 8 + c]));
+            }
+            a += ty.w[j] * ra;
+            sx += ty.w[j] * rgx;
+            sy += ty.w[j] * rgy;
+        }
+        (a, sx, sy)
+    } else {
+        (
+            sample_taps(p, base_x, base_y, tx, ty),
+            sample_taps(gx, base_x, base_y, tx, ty),
+            sample_taps(gy, base_x, base_y, tx, ty),
+        )
+    }
+}
+
 /// Estimate the rigid transform of frame relative to reference, in sensor
 /// pixels (translation) and radians (rotation about the frame centre).
 pub fn estimate(reference: &RawFrame, frame: &RawFrame) -> Result<Shift> {
@@ -197,15 +326,18 @@ pub fn estimate_series_with_grids(
     if frames.len() == 1 {
         return Ok((shifts, grids));
     }
+    let debug_shift = std::env::var_os("PIXELSHIFT_DEBUG_SHIFT").is_some();
+    let t = std::time::Instant::now();
     let preps = build_preps(first);
     let global = GlobalPrep::build(first);
+    TIMERS.prep.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
     let direct: Vec<Measurement> = frames[1..]
         .par_iter()
         .map(|f| measure(&preps, &global, f, first.width, first.height))
         .collect();
     let mut weak = vec![false; frames.len()];
     for (i, (s, g, ncc)) in direct.into_iter().enumerate() {
-        if std::env::var_os("PIXELSHIFT_DEBUG_SHIFT").is_some() {
+        if debug_shift {
             eprintln!(
                 "direct frame {}: ({:+.3}, {:+.3}) rot {:+.1}\" residual {:.3} ncc {:.3} weak {}",
                 i + 1,
@@ -234,7 +366,7 @@ pub fn estimate_series_with_grids(
         let Ok(step) = estimate(&frames[i - 1], &frames[i]) else {
             continue;
         };
-        if std::env::var_os("PIXELSHIFT_DEBUG_SHIFT").is_some() {
+        if debug_shift {
             eprintln!(
                 "chained frame {} through {}: step ({:+.3}, {:+.3}) residual {:.3} ncc-ish {:.3}",
                 i,
@@ -247,6 +379,9 @@ pub fn estimate_series_with_grids(
         }
         shifts[i] = compose(prev, step);
         grids[i] = None;
+    }
+    if debug_shift {
+        eprintln!("{}", timers_report());
     }
     Ok((shifts, grids))
 }
@@ -475,14 +610,14 @@ fn pyramid_level(p: &Plane, steps: usize) -> Plane {
 /// lattice px (the same convention as the window search: reference(x + s) ~
 /// frame(x)). Quasi-periodic scenes put several coarse NCC peaks within a few
 /// hundredths of each other, so the strongest `keep` peaks are returned and
-/// the caller ranks them after a full resolution refinement.
+/// the caller ranks them after a full resolution refinement. `full` is the
+/// frame's full-frame lattice plane, shared with the target window builds.
 fn global_shift_candidates(
     global: &GlobalPrep,
-    frame: &RawFrame,
     keep: usize,
+    full: &Plane,
 ) -> Vec<(f64, f64)> {
-    let full = luma_plane(frame, Rect::new(0, 0, frame.width / 2, frame.height / 2));
-    let coarse = pyramid_level(&full, global.factor.ilog2() as usize);
+    let coarse = pyramid_level(full, global.factor.ilog2() as usize);
     let peaks = coarse_shift_top(&global.coarse, &coarse, (0, 0), PYRAMID_RADIUS, keep);
     if std::env::var_os("PIXELSHIFT_DEBUG_SHIFT").is_some() {
         eprintln!(
@@ -543,38 +678,63 @@ fn measure(
     // Rank the coarse candidates by the texture weighted correlation of ALL
     // windows at the refined translation: a single window of a repetitive
     // scene is multi-modal (its local NCC can prefer a false offset), the
-    // whole field cannot.
-    let tgts: Vec<Plane> = preps.iter().map(|p| luma_plane(frame, p.rect)).collect();
+    // whole field cannot. Candidates and windows are independent, so the
+    // whole ranking runs in parallel; the scores are summed sequentially per
+    // candidate and folded in candidate order, keeping the sequential
+    // tie-breaking (first strictly better candidate wins).
+    let t = std::time::Instant::now();
+    // One full-frame lattice plane per frame feeds every window target and
+    // the coarse pyramid: the 5x5 windows overlap, so 25 separate builds
+    // would blur the same content ~9x over.
+    let full = luma_plane(frame, Rect::new(0, 0, frame.width / 2, frame.height / 2));
+    let tgts: Vec<Plane> = preps.par_iter().map(|p| sub_plane(&full, p.rect)).collect();
+    TIMERS.tgts.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
     let center = &preps[ci];
     let center_tgt = &tgts[ci];
     let energy_sum: f64 = preps.iter().map(|p| p.energy).sum::<f64>().max(1e-9);
+    let t = std::time::Instant::now();
+    let cands = global_shift_candidates(global, ALIGN_CANDIDATES, &full);
+    TIMERS.global.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+    let scored: Vec<((f64, f64), f32)> = cands
+        .par_iter()
+        .map(|cand| {
+            let search = (cand.0.round() as i32, cand.1.round() as i32);
+            let t = std::time::Instant::now();
+            let (ix, iy, _) = coarse_shift(&center.plane, center_tgt, search, SEARCH_RADIUS);
+            let s = refine(center, center_tgt, (ix as f64, iy as f64));
+            TIMERS.candidate.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+            let t = std::time::Instant::now();
+            let parts: Vec<f64> = preps
+                .par_iter()
+                .zip(tgts.par_iter())
+                .map(|(prep, tgt)| prep.energy * window_ncc(prep, tgt, s).max(0.0) as f64)
+                .collect();
+            TIMERS.rank_ncc.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+            let score = (parts.iter().sum::<f64>() / energy_sum) as f32;
+            if std::env::var_os("PIXELSHIFT_DEBUG_SHIFT").is_some() {
+                eprintln!(
+                    "candidate ({:+.2}, {:+.2}) refined ({:+.2}, {:+.2}) field ncc {score:.4}",
+                    cand.0, cand.1, s.0, s.1
+                );
+            }
+            (s, score)
+        })
+        .collect();
     let mut best: Option<((f64, f64), f32)> = None;
-    for cand in global_shift_candidates(global, frame, ALIGN_CANDIDATES) {
-        let search = (cand.0.round() as i32, cand.1.round() as i32);
-        let (ix, iy, _) = coarse_shift(&center.plane, center_tgt, search, SEARCH_RADIUS);
-        let s = refine(center, center_tgt, (ix as f64, iy as f64));
-        let mut score = 0.0f64;
-        for (prep, tgt) in preps.iter().zip(tgts.iter()) {
-            score += prep.energy * window_ncc(prep, tgt, s).max(0.0) as f64;
-        }
-        let score = (score / energy_sum) as f32;
-        if std::env::var_os("PIXELSHIFT_DEBUG_SHIFT").is_some() {
-            eprintln!(
-                "candidate ({:+.2}, {:+.2}) refined ({:+.2}, {:+.2}) field ncc {score:.4}",
-                cand.0, cand.1, s.0, s.1
-            );
-        }
+    for (s, score) in scored {
         if best.map_or(true, |b| score > b.1) {
             best = Some((s, score));
         }
     }
     let (init, _) = best.unwrap_or(((0.0, 0.0), 0.0));
     let search = (init.0.round() as i32, init.1.round() as i32);
+    let t = std::time::Instant::now();
     let ests: Vec<WindowEst> = preps
         .par_iter()
         .zip(tgts.par_iter())
         .map(|(p, t)| estimate_window_tgt(p, t, search, Some(init)))
         .collect();
+    TIMERS.windows.fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
     fit_rigid(&ests, cx, cy)
 }
 
@@ -971,6 +1131,15 @@ fn solve3(m: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
 /// block, black subtracted and low passed. The rectangle is in lattice
 /// coordinates.
 pub(crate) fn luma_plane(frame: &RawFrame, rect: Rect) -> Plane {
+    let mut plane = lattice_sums(frame, rect);
+    blur(&mut plane.data, plane.w, plane.h);
+    plane
+}
+
+/// The same block sums without the low pass: one full-frame pass feeds both
+/// the per-frame working planes (blurred once over the whole frame) and the
+/// alignment pyramid, instead of 25 overlapping window builds per frame.
+pub(crate) fn lattice_sums(frame: &RawFrame, rect: Rect) -> Plane {
     let w = frame.width;
     let black = frame.black_for(Color::R) as f32
         + 2.0 * frame.black_for(Color::G) as f32
@@ -989,8 +1158,24 @@ pub(crate) fn luma_plane(frame: &RawFrame, rect: Rect) -> Plane {
             data[yy * pw + xx] = s - black;
         }
     }
-    blur(&mut data, pw, ph);
     Plane { w: pw, h: ph, data }
+}
+
+/// Sub-rectangle of a larger plane, row copied. All readers of a target
+/// window plane stay >= 8 lattice px inside its edge (coarse_shift margins 8,
+/// refine and window_ncc read `inner`, which is inset 12), where the
+/// full-frame low pass and a window-local low pass agree bit for bit.
+fn sub_plane(full: &Plane, rect: Rect) -> Plane {
+    let mut data = Vec::with_capacity(rect.w * rect.h);
+    for y in rect.y..rect.y + rect.h {
+        let start = y * full.w + rect.x;
+        data.extend_from_slice(&full.data[start..start + rect.w]);
+    }
+    Plane {
+        w: rect.w,
+        h: rect.h,
+        data,
+    }
 }
 
 fn blur(data: &mut [f32], w: usize, h: usize) {
@@ -999,8 +1184,13 @@ fn blur(data: &mut [f32], w: usize, h: usize) {
 
 /// Gaussian blur with an explicit kernel; the pyramid levels need a stronger
 /// low pass (sigma 1.6) than the lattice build before they halve.
+///
+/// Interior samples read their tap window directly; only the r-wide border
+/// pays for index clamping. The tap accumulation order matches the naive
+/// clamped form, so the result is bit exact.
 fn blur_with(data: &mut [f32], w: usize, h: usize, r: i32, sigma: f32) {
     let r = r;
+    let ru = r as usize;
     let mut k = Vec::with_capacity((2 * r + 1) as usize);
     for i in -r..=r {
         k.push((-(i * i) as f32 / (2.0 * sigma * sigma)).exp());
@@ -1010,24 +1200,81 @@ fn blur_with(data: &mut [f32], w: usize, h: usize, r: i32, sigma: f32) {
         *v /= norm;
     }
     let mut tmp = vec![0.0f32; data.len()];
+    // A plane narrower or taller than the kernel has no unclamped interior;
+    // everything runs through the clamped form.
+    let narrow = w <= 2 * ru + 1;
+    let short = h <= 2 * ru + 1;
+    // Horizontal pass into tmp.
     for y in 0..h {
-        for x in 0..w {
+        let row = &data[y * w..y * w + w];
+        let out = &mut tmp[y * w..y * w + w];
+        if narrow {
+            for x in 0..w {
+                let mut acc = 0.0f32;
+                for (i, kv) in k.iter().enumerate() {
+                    let sx = (x as i64 + i as i64 - r as i64).clamp(0, w as i64 - 1) as usize;
+                    acc += kv * row[sx];
+                }
+                out[x] = acc;
+            }
+            continue;
+        }
+        for x in ru..w - ru {
+            let win = &row[x - ru..x + ru + 1];
+            let mut acc = 0.0f32;
+            for (kv, &v) in k.iter().zip(win) {
+                acc += kv * v;
+            }
+            out[x] = acc;
+        }
+        for x in 0..ru {
             let mut acc = 0.0f32;
             for (i, kv) in k.iter().enumerate() {
                 let sx = (x as i64 + i as i64 - r as i64).clamp(0, w as i64 - 1) as usize;
-                acc += kv * data[y * w + sx];
+                acc += kv * row[sx];
             }
-            tmp[y * w + x] = acc;
+            out[x] = acc;
         }
-    }
-    for y in 0..h {
-        for x in 0..w {
+        for x in w - ru..w {
             let mut acc = 0.0f32;
             for (i, kv) in k.iter().enumerate() {
-                let sy = (y as i64 + i as i64 - r as i64).clamp(0, h as i64 - 1) as usize;
-                acc += kv * tmp[sy * w + x];
+                let sx = (x as i64 + i as i64 - r as i64).clamp(0, w as i64 - 1) as usize;
+                acc += kv * row[sx];
             }
-            data[y * w + x] = acc;
+            out[x] = acc;
+        }
+    }
+    // Vertical pass back into data.
+    for y in 0..h {
+        if short {
+            for x in 0..w {
+                let mut acc = 0.0f32;
+                for (i, kv) in k.iter().enumerate() {
+                    let sy = (y as i64 + i as i64 - r as i64).clamp(0, h as i64 - 1) as usize;
+                    acc += kv * tmp[sy * w + x];
+                }
+                data[y * w + x] = acc;
+            }
+            continue;
+        }
+        if (ru..h - ru).contains(&y) {
+            let out = &mut data[y * w..y * w + w];
+            for (x, o) in out.iter_mut().enumerate() {
+                let mut acc = 0.0f32;
+                for (i, kv) in k.iter().enumerate() {
+                    acc += kv * tmp[(y + i - ru) * w + x];
+                }
+                *o = acc;
+            }
+        } else {
+            for x in 0..w {
+                let mut acc = 0.0f32;
+                for (i, kv) in k.iter().enumerate() {
+                    let sy = (y as i64 + i as i64 - r as i64).clamp(0, h as i64 - 1) as usize;
+                    acc += kv * tmp[sy * w + x];
+                }
+                data[y * w + x] = acc;
+            }
         }
     }
 }
@@ -1141,11 +1388,11 @@ fn window_ncc(prep: &CropPrep, target: &Plane, s: (f64, f64)) -> f32 {
     let (bx, by) = (fx0 as i64, fy0 as i64);
     let (mut sa, mut sb, mut saa, mut sbb, mut sab, mut n) =
         (0.0f64, 0.0, 0.0, 0.0, 0.0, 0.0);
-    for py in (inner.y..inner.y + inner.h).step_by(stride) {
-        let base_y = py as i64 + by;
-        for px in (inner.x..inner.x + inner.w).step_by(stride) {
-            let base_x = px as i64 + bx;
-            let a = sample_taps(&prep.plane, base_x, base_y, &tx, &ty) as f64;
+        for py in (inner.y..inner.y + inner.h).step_by(stride) {
+            let base_y = py as i64 + by;
+            for px in (inner.x..inner.x + inner.w).step_by(stride) {
+                let base_x = px as i64 + bx;
+                let a = sample_taps_inner(&prep.plane, base_x, base_y, &tx, &ty) as f64;
             let b = target.data[py * target.w + px] as f64;
             sa += a;
             sb += b;
@@ -1190,10 +1437,11 @@ fn refine(prep: &CropPrep, target: &Plane, s0: (f64, f64)) -> (f64, f64) {
             let base_y = py as i64 + by;
             for px in (inner.x..inner.x + inner.w).step_by(stride) {
                 let base_x = px as i64 + bx;
-                let a = sample_taps(&prep.plane, base_x, base_y, &tx, &ty) as f64;
+                let (a, gx, gy) = sample_grad_taps(&prep.plane, &prep.gx, &prep.gy, base_x, base_y, &tx, &ty);
+                let a = a as f64;
                 let t = target.data[py * target.w + px] as f64;
-                let gx = sample_taps(&prep.gx, base_x, base_y, &tx, &ty) as f64;
-                let gy = sample_taps(&prep.gy, base_x, base_y, &tx, &ty) as f64;
+                let gx = gx as f64;
+                let gy = gy as f64;
                 let res = a - t;
                 let wgt = if scale > 0.0 {
                     1.0 / (1.0 + (res / scale) * (res / scale))

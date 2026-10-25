@@ -41,6 +41,12 @@ const RECON_RADIUS: i64 = 1;
 const HOLE_WEIGHT: f32 = 0.05;
 /// Output rows accumulated by one rayon task.
 const BAND_ROWS: usize = 128;
+/// Edge of one square output tile accumulated by one rayon task: a 128x128
+/// tile of i32 + f32 accumulators is 393 KB and stays resident in the private
+/// L2, so the 4x4 splat writes cost L2 bandwidth instead of DRAM bandwidth.
+/// Row bands of 128 rows were bandwidth bound: their 18 MB working set
+/// spilled out of L3 on every tap.
+const TILE: usize = 128;
 /// Weight resolution stored per output pixel and channel (1/8 sample unit).
 const COV_SCALE: f32 = 8.0;
 const MAX_FILL_ITERS: usize = 64;
@@ -98,13 +104,17 @@ struct FrameView<'a> {
     black: [f32; CHANNELS],
 }
 
-struct BandOut {
+struct TileOut {
+    tx0: usize,
+    ty0: usize,
+    tw: usize,
+    th: usize,
     planes: [Vec<u16>; CHANNELS],
     cov: [Vec<u8>; CHANNELS],
     weight_sum: [f64; CHANNELS],
 }
 
-/// Reconstruct the output image described by params.
+/// Reconstruct the output described by params.
 /// params.shifts must be aligned with frames (shifts[0] == 0,0).
 pub fn merge(frames: &[RawFrame], params: &MergeParams) -> Result<MergeResult> {
     let started = Instant::now();
@@ -183,13 +193,16 @@ pub fn merge(frames: &[RawFrame], params: &MergeParams) -> Result<MergeResult> {
             .collect()
     };
 
-    let band_count = oh.div_ceil(BAND_ROWS);
-    let bands: Vec<BandOut> = (0..band_count)
+    let tiles_x = ow.div_ceil(TILE);
+    let tiles_y = oh.div_ceil(TILE);
+    let tiles: Vec<TileOut> = (0..tiles_x * tiles_y)
         .into_par_iter()
-        .map(|b| {
-            let y0 = b * BAND_ROWS;
-            let rows = BAND_ROWS.min(oh - y0);
-            run_band(&views, ow, oh, y0, rows, span_f)
+        .map(|t| {
+            let tx0 = (t % tiles_x) * TILE;
+            let ty0 = (t / tiles_x) * TILE;
+            let tw = TILE.min(ow - tx0);
+            let th = TILE.min(oh - ty0);
+            run_tile(&views, ow, oh, tx0, ty0, tw, th, span_f)
         })
         .collect();
 
@@ -200,17 +213,18 @@ pub fn merge(frames: &[RawFrame], params: &MergeParams) -> Result<MergeResult> {
     ];
     let mut cov: [Vec<u8>; CHANNELS] = [vec![0; ow * oh], vec![0; ow * oh], vec![0; oh * ow]];
     let mut weight_sum = [0.0f64; CHANNELS];
-    for (b, band) in bands.iter().enumerate() {
-        let y0 = b * BAND_ROWS;
-        let rows = BAND_ROWS.min(oh - y0);
+    for tile in tiles.iter() {
         for c in 0..CHANNELS {
-            let dst = y0 * ow..(y0 + rows) * ow;
-            planes[c][dst.clone()].copy_from_slice(&band.planes[c]);
-            cov[c][dst].copy_from_slice(&band.cov[c]);
-            weight_sum[c] += band.weight_sum[c];
+            for r in 0..tile.th {
+                let dst = (tile.ty0 + r) * ow + tile.tx0;
+                planes[c][dst..dst + tile.tw].copy_from_slice(&tile.planes[c][r * tile.tw..(r + 1) * tile.tw]);
+                cov[c][dst..dst + tile.tw]
+                    .copy_from_slice(&tile.cov[c][r * tile.tw..(r + 1) * tile.tw]);
+            }
+            weight_sum[c] += tile.weight_sum[c];
         }
     }
-    drop(bands);
+    drop(tiles);
 
     let mut max_cov = [0u8; CHANNELS];
     for (c, mc) in max_cov.iter_mut().enumerate() {
@@ -448,35 +462,111 @@ fn used_frames(params: &MergeParams, shifts: &[Shift]) -> Vec<usize> {
     keep
 }
 
-fn run_band(
+/// One source row of the residual correction grid. The anchor-row
+/// interpolation of ShiftGrid::sample is fixed per source row, so a sample
+/// only pays for its column position. Values match ShiftGrid::sample up to
+/// the association of the row and column interpolations (last ulp).
+struct GridRow {
+    cols: usize,
+    x0: f64,
+    step_x: f64,
+    dx: Vec<f64>,
+    dy: Vec<f64>,
+}
+
+impl GridRow {
+    fn new(g: &ShiftGrid, y: f64) -> Self {
+        let fy = ((y - g.y0) / g.step_y).clamp(0.0, (g.rows - 1) as f64);
+        let r0 = fy.floor() as usize;
+        let r1 = (r0 + 1).min(g.rows - 1);
+        let ty = fy - r0 as f64;
+        let mut dx = Vec::with_capacity(g.cols);
+        let mut dy = Vec::with_capacity(g.cols);
+        for c in 0..g.cols {
+            dx.push(g.dx[c + r0 * g.cols] as f64 * (1.0 - ty) + g.dx[c + r1 * g.cols] as f64 * ty);
+            dy.push(g.dy[c + r0 * g.cols] as f64 * (1.0 - ty) + g.dy[c + r1 * g.cols] as f64 * ty);
+        }
+        Self {
+            cols: g.cols,
+            x0: g.x0,
+            step_x: g.step_x,
+            dx,
+            dy,
+        }
+    }
+
+    /// Column-interpolated residual at sensor x of this row.
+    #[inline]
+    fn sample(&self, x: f64) -> (f64, f64) {
+        let fx = ((x - self.x0) / self.step_x).clamp(0.0, (self.cols - 1) as f64);
+        let c0 = fx.floor() as usize;
+        let c1 = (c0 + 1).min(self.cols - 1);
+        let tx = fx - c0 as f64;
+        let dx = self.dx[c0] * (1.0 - tx) + self.dx[c1] * tx;
+        let dy = self.dy[c0] * (1.0 - tx) + self.dy[c1] * tx;
+        (dx, dy)
+    }
+}
+
+fn run_tile(
     views: &[FrameView],
     ow: usize,
     oh: usize,
-    y0: usize,
-    rows: usize,
+    tx0: usize,
+    ty0: usize,
+    tw: usize,
+    th: usize,
     span: f32,
-) -> BandOut {
-    let n = ow * rows;
+) -> TileOut {
+    let n = tw * th;
     let mut sum: [Vec<i32>; CHANNELS] = [vec![0i32; n], vec![0i32; n], vec![0i32; n]];
     let mut wt: [Vec<f32>; CHANNELS] = [vec![0f32; n], vec![0f32; n], vec![0f32; n]];
-    let y_end = y0 + rows;
+    let (ty1, tx1) = (ty0 + th, tx0 + tw);
+    let (ty0_i64, ty1_i64, tx0_i64, tx1_i64) =
+        (ty0 as i64, ty1 as i64, tx0 as i64, tx1 as i64);
+    let _ = (ow, oh);
 
     for f in views {
-        // Source rows whose image can reach this band, rotation included.
-        let lo_out = y0 as f64 - 1.0 - f.rot_margin;
-        let hi_out = y_end as f64 + 1.0 + f.rot_margin;
+        // Source rows whose splat can reach this tile, rotation included:
+        // the splat of yy covers output rows floor(yy)-1 .. floor(yy)+2, so
+        // rows [ty0, ty1) need yy in [ty0-2, ty1+1); rot_margin covers the
+        // yy spread the rotation term adds across the row.
+        let lo_out = ty0 as f64 - 3.0 - f.rot_margin;
+        let hi_out = ty1 as f64 + 2.0 + f.rot_margin;
         let ylo = (((lo_out - f.oy) / f.by + f.cy) - 2.0).floor().max(0.0) as usize;
         let yhi = (((hi_out - f.oy) / f.by + f.cy) + 2.0).ceil().min(f.h as f64) as usize;
         for y in ylo..yhi.min(f.h) {
             let ry = y as f64 - f.cy;
             let base_x = f.ox + f.bx * ry;
             let base_y = f.oy + f.by * ry;
+            // Source x whose splat window can reach [tx0, tx1): xx = base_x +
+            // ax * (x - cx) with ax >= kf * cos(rot) > 0, so the output range
+            // inverts directly into an x range. The slack is absorbed by the
+            // tap clipping below; the exact tile-internal index bounds are
+            // what keeps every write inside the accumulator.
+            let xlo = (((tx0 as f64 - 3.0 - base_x) / f.ax + f.cx) - 2.0)
+                .floor()
+                .max(0.0) as usize;
+            let xhi = (((tx1 as f64 + 2.0 - base_x) / f.ax + f.cx) + 2.0)
+                .ceil()
+                .min(f.w as f64) as usize;
+            if xlo >= xhi {
+                continue;
+            }
             let c_even = f.cfa.0[y & 1][0];
             let c_odd = f.cfa.0[y & 1][1];
             let base = y * f.w;
-            for x in 0..f.w {
-                if let Some(m) = f.mask {
-                    if m.blocked_at(x, y) {
+            // Row-invariant parts of the motion mask: the cell row is fixed,
+            // only the cell column follows x (x < frame width keeps
+            // x / step below cols, the min only guards odd masks).
+            let mask_cells = f.mask.map(|m| {
+                let cell = (y / m.step).min(m.rows - 1) * m.cols;
+                (&m.blocked[cell..cell + m.cols], m.step, m.cols - 1)
+            });
+            let grid_row = f.grid.as_ref().map(|g| GridRow::new(g, y as f64));
+            for x in xlo..xhi {
+                if let Some((cells, step, last)) = mask_cells {
+                    if cells[(x / step).min(last)] != 0 {
                         continue;
                     }
                 }
@@ -488,8 +578,8 @@ fn run_band(
                 let rx = x as f64 - f.cx;
                 let mut xx = base_x + f.ax * rx;
                 let mut yy = base_y + f.ay * rx;
-                if let Some(g) = &f.grid {
-                    let (gdx, gdy) = g.sample(x as f64, y as f64);
+                if let Some(g) = &grid_row {
+                    let (gdx, gdy) = g.sample(x as f64);
                     xx += f.scale * gdx;
                     yy += f.scale * gdy;
                 }
@@ -497,7 +587,7 @@ fn run_band(
                 let fy = (yy - yb) as f32;
                 let yb_i = yb as i64;
                 let first_row = yb_i - RECON_RADIUS;
-                if first_row + 3 < y0 as i64 || first_row >= y_end as i64 {
+                if first_row + 3 < ty0_i64 || first_row >= ty1_i64 {
                     continue;
                 }
                 let wy = cr_weights(fy);
@@ -505,26 +595,28 @@ fn run_band(
                 let fx = (xx - xb) as f32;
                 let xb_i = xb as i64;
                 let first_col = xb_i - RECON_RADIUS;
-                if first_col + 3 < 0 || first_col >= ow as i64 {
+                if first_col + 3 < tx0_i64 || first_col >= tx1_i64 {
                     continue;
                 }
                 let wx = cr_weights(fx);
+                // The tap tests against the tile bounds depend only on
+                // first_row / first_col, so they fold into loop bounds and
+                // the 4x4 scatter runs without per-tap branches. Tiles
+                // partition the output, so tile clipping implies image
+                // clipping.
+                let k_lo = (ty0_i64 - first_row).clamp(0, 4) as usize;
+                let k_hi = (ty1_i64 - first_row).clamp(0, 4) as usize;
+                let j_lo = (tx0_i64 - first_col).clamp(0, 4) as usize;
+                let j_hi = (tx1_i64 - first_col).clamp(0, 4) as usize;
                 let s = &mut sum[ci];
                 let w = &mut wt[ci];
-                for (k, &wyv) in wy.iter().enumerate() {
-                    let r = first_row + k as i64;
-                    if r < y0 as i64 || r >= y_end as i64 {
-                        continue;
-                    }
-                    let row = (r - y0 as i64) as usize * ow;
-                    for (j, &wxv) in wx.iter().enumerate() {
-                        let c0 = first_col + j as i64;
-                        if c0 < 0 || c0 >= ow as i64 {
-                            continue;
-                        }
-                        let i = row + c0 as usize;
-                        s[i] += (v * wxv * wyv) as i32;
-                        w[i] += wxv * wyv;
+                for k in k_lo..k_hi {
+                    let row = (first_row + k as i64 - ty0_i64) as usize * tw;
+                    let wyv = wy[k];
+                    for j in j_lo..j_hi {
+                        let i = row + (first_col + j as i64 - tx0_i64) as usize;
+                        s[i] += (v * wx[j] * wyv) as i32;
+                        w[i] += wx[j] * wyv;
                     }
                 }
             }
@@ -548,9 +640,12 @@ fn run_band(
         for &weight in w.iter() {
             weight_sum[c] += weight as f64;
         }
-        let _ = oh;
     }
-    BandOut {
+    TileOut {
+        tx0,
+        ty0,
+        tw,
+        th,
         planes,
         cov,
         weight_sum,
