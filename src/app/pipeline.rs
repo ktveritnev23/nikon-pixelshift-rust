@@ -296,6 +296,27 @@ pub fn sibling_1x_path(path: &Path) -> PathBuf {
     out
 }
 
+/// Human readable duration: 4500 ms -> "4.5 s", 320000 ms -> "5 min 20.0 s",
+/// below a second the milliseconds stay explicit. Units are the language
+/// neutral "ms"/"s"/"min"/"h" (log lines and timings stay English).
+pub fn fmt_duration(ms: u64) -> String {
+    let s = ms as f64 / 1000.0;
+    if s < 1.0 {
+        return format!("{ms} ms");
+    }
+    if s < 60.0 {
+        return format!("{s:.1} s");
+    }
+    let min = (s / 60.0).floor() as u64;
+    let rem = s - min as f64 * 60.0;
+    if min < 60 {
+        return format!("{min} min {rem:.1} s");
+    }
+    let hours = min / 60;
+    let rem_min = min % 60;
+    format!("{hours} h {rem_min} min")
+}
+
 pub fn fmt_bytes(bytes: u64) -> String {
     let mib = bytes as f64 / (1024.0 * 1024.0);
     if mib >= 1024.0 {
@@ -322,6 +343,11 @@ pub fn frame_info(frame: &RawFrame) -> crate::app::model::FrameInfo {
         camera: format!("{} {}", frame.make.trim(), frame.model.trim())
             .trim()
             .to_string(),
+        timestamp: frame.timestamp.clone(),
+        lens: format!("{} {}", frame.lens_make.trim(), frame.lens_model.trim())
+            .trim()
+            .to_string(),
+        shutter_count: crate::rawio::shutter_count(&frame.path),
     }
 }
 
@@ -623,6 +649,20 @@ pub fn write_output(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn durations_are_human_readable() {
+        assert_eq!(fmt_duration(450), "450 ms");
+        assert_eq!(fmt_duration(999), "999 ms");
+        assert_eq!(fmt_duration(1000), "1.0 s");
+        assert_eq!(fmt_duration(4500), "4.5 s");
+        assert_eq!(fmt_duration(59_900), "59.9 s");
+        assert_eq!(fmt_duration(60_000), "1 min 0.0 s");
+        assert_eq!(fmt_duration(320_000), "5 min 20.0 s");
+        assert_eq!(fmt_duration(3_725_000), "1 h 2 min");
+    }
+
     use super::*;
     use crate::types::Cfa;
 

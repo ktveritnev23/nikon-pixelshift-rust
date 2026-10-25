@@ -101,12 +101,11 @@ impl UiPrefs {
         ui.heading(lang.t("Settings", "Настройки"));
         ui.horizontal(|ui| {
             ui.label(lang.t("Language", "Язык"));
-            changed |= ui
-                .selectable_value(&mut self.lang, Lang::En, "English")
-                .changed();
-            changed |= ui
-                .selectable_value(&mut self.lang, Lang::Ru, "Русский")
-                .changed();
+            for candidate in Lang::ALL {
+                changed |= ui
+                    .selectable_value(&mut self.lang, candidate, candidate.label())
+                    .changed();
+            }
         });
         ui.horizontal(|ui| {
             ui.label(lang.t("Theme", "Тема"));

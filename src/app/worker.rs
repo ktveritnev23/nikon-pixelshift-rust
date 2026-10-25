@@ -3,7 +3,9 @@
 //! travel back over an mpsc channel, the GUI stays responsive.
 
 use crate::app::demo;
-use crate::app::model::{EditOptions, FrameInfo, OutFormat, Stage, ViewSource, MAX_PREVIEW_DIM};
+use crate::app::model::{
+    EditOptions, FrameInfo, OutFormat, PreviewSlot, Stage, ViewSource, MAX_PREVIEW_DIM,
+};
 use crate::app::pipeline::{self, ResultInfo, SeriesInfo};
 use crate::types::{MergeResult, MergeStats, PreviewImage, RawFrame, Shift};
 use crate::write::DngFlavor;
@@ -56,6 +58,12 @@ pub enum Command {
     FitDistort {
         reference: PathBuf,
     },
+    /// Decode only the first file of a series and send its preview, so the
+    /// canvas shows something before any merge.
+    Preview {
+        index: usize,
+        path: PathBuf,
+    },
     SaveAs {
         index: usize,
         path: PathBuf,
@@ -99,6 +107,10 @@ pub enum Event {
         bytes: u64,
     },
     Fitted(crate::fit::FitReport),
+    FirstPreview {
+        index: usize,
+        slot: PreviewSlot,
+    },
     Finished,
     Error(String),
 }
@@ -209,6 +221,7 @@ impl Session {
             Command::View { source, rect, step } => self.view(source, rect, step),
             Command::Distort { distort } => self.distort(distort),
             Command::FitDistort { reference } => self.fit_distort(&reference),
+            Command::Preview { index, path } => self.preview(index, &path),
             Command::SaveAs {
                 index,
                 path,
@@ -420,6 +433,31 @@ impl Session {
         }
         self.stage(Stage::Done);
         self.send(Event::Finished);
+        Ok(())
+    }
+
+    /// Decode one file and send its canvas preview.
+    fn preview(&mut self, index: usize, path: &Path) -> Result<()> {
+        let frame = if self.mode == Mode::Demo {
+            demo::frames().into_iter().next().ok_or_else(|| anyhow!("no demo frame"))?
+        } else {
+            pipeline::decode(&[path.to_path_buf()])?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("{}: no frames", path.display()))?
+        };
+        let wb = pipeline::preview_wb(&frame);
+        let image = pipeline::reference_preview(&frame, None, MAX_PREVIEW_DIM, wb, 1);
+        self.send(Event::FirstPreview {
+            index,
+            slot: PreviewSlot {
+                image,
+                source: ViewSource::Merged,
+                rect: None,
+                step: 1,
+                generation: 0,
+            },
+        });
         Ok(())
     }
 

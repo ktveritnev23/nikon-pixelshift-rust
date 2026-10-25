@@ -225,7 +225,7 @@ impl PixelShiftApp {
         pipeline::apply_threads(self.state.options.threads);
         self.state.error = None;
         self.state.enter_stage(Stage::Decoding);
-        let options = self.state.options.clone();
+        let options = self.state.series_options(index);
         self.worker.send(Command::Load {
             index,
             options,
@@ -252,23 +252,28 @@ impl PixelShiftApp {
             self.state.batch_running = false;
             return;
         };
+        if !series.queued {
+            // A series unchecked while queued: skip it instead of merging
+            // against the user's intent.
+            self.advance_batch();
+            return;
+        }
         let info = series.info.clone();
-        let scale = self
-            .state
-            .options
+        let options = self.state.series_options(index);
+        let scale = options
             .scale
             .resolve(info.frame_count(), info.suggested_scale);
         let Some(first) = info.files.first() else {
             self.state.batch_running = false;
             return;
         };
-        let path = pipeline::default_output_path(first, scale, self.state.options.format.ext());
+        let path = pipeline::default_output_path(first, scale, options.format.ext());
         let save = Some(SaveTarget {
             path,
-            format: self.state.options.format,
-            flavor: self.state.options.flavor,
-            tiff_render: self.state.options.tiff_render,
-            also_1x: self.state.options.also_1x,
+            format: options.format,
+            flavor: options.flavor,
+            tiff_render: options.tiff_render,
+            also_1x: options.also_1x,
         });
         self.state.selected = index;
         self.state.selected_frame = 0;
@@ -334,6 +339,9 @@ impl PixelShiftApp {
                     self.state.enter_stage(Stage::Scanning);
                     self.worker.send(Command::Scan(inputs));
                 }
+                Request::PreviewFirst { index, path } => {
+                    self.worker.send(Command::Preview { index, path });
+                }
                 Request::Load => {
                     let index = self.state.selected;
                     self.load_selected(index, None);
@@ -343,6 +351,15 @@ impl PixelShiftApp {
                 }
                 Request::Distort { distort } => {
                     self.worker.send(Command::Distort { distort });
+                }
+                Request::SetPinned { index, pinned } => {
+                    if let Some(series) = self.state.series.get_mut(index) {
+                        series.pinned = if pinned {
+                            Some(self.state.options.clone())
+                        } else {
+                            None
+                        };
+                    }
                 }
                 Request::PickDistortReference => {
                     if let Some(path) = rfd::FileDialog::new()
@@ -371,7 +388,9 @@ impl PixelShiftApp {
                 }
                 Request::StartBatch => {
                     if self.state.queue.is_empty() {
-                        self.state.queue = (0..self.state.series.len()).collect();
+                        self.state.queue = (0..self.state.series.len())
+                            .filter(|&i| self.state.series[i].queued)
+                            .collect();
                     }
                     self.state.batch_running = true;
                     self.advance_batch();

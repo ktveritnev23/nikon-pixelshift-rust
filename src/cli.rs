@@ -5,7 +5,7 @@
 //!                   [--format dng|tiff] [--compression none|lossless] [--motion]
 //!                   [--also-1x] [--no-align] [--threads N] [--quiet]
 //!   pixelshift inspect <input...>
-//!   pixelshift gui [--selftest] [--demo] [--lang auto|en|ru]
+//!   pixelshift gui [--selftest] [--demo] [--lang auto|en|ru|zh|ja]
 //!                   [--theme auto|dark|light] [--font system|builtin]
 //!                   [--distort K1[,K2[,K3]]] [--shot PATH] [--shot-zoom Z]
 //!                   [--shot-crop X,Y,W,H] [--shot-source merged|reference]
@@ -252,10 +252,13 @@ pub struct InspectArgs {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum LangArg {
-    /// Follow the system locale (ru-* -> Russian, otherwise English).
+    /// Follow the system locale (ru-* -> Russian, zh-* -> Chinese, ja-* ->
+    /// Japanese, otherwise English).
     Auto,
     En,
     Ru,
+    Zh,
+    Ja,
 }
 
 impl LangArg {
@@ -264,6 +267,8 @@ impl LangArg {
             LangArg::Auto => Lang::detect(),
             LangArg::En => Lang::En,
             LangArg::Ru => Lang::Ru,
+            LangArg::Zh => Lang::Zh,
+            LangArg::Ja => Lang::Ja,
         }
     }
 }

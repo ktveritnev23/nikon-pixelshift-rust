@@ -88,8 +88,86 @@ pub fn draw(
         .resizable(true)
         .default_size(150.0)
         .show(ui, |ui| bottom_panel(state, lang, ui));
+    if state.show_meta {
+        let _ = egui::Panel::right("pixelshift-meta")
+            .resizable(true)
+            .default_size(230.0)
+            .show(ui, |ui| meta_panel(state, lang, ui));
+    }
     let _ = egui::CentralPanel::default_margins().show(ui, |ui| canvas(state, cache, lang, ui));
     changed
+}
+
+/// Basic metadata of the selected series: camera, lens, exposure, capture
+/// time and the shutter counter of the last frame.
+fn meta_panel(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
+    ui.heading(lang.t("Metadata", "Метаданные"));
+    let Some(series) = state.selected_series() else {
+        ui.label(lang.t("no series loaded", "серии не загружены"));
+        return;
+    };
+    let first = series.frames.first();
+    let last = series.frames.last();
+    egui::Grid::new("pixelshift-meta-grid")
+        .num_columns(2)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            let mut row = |name: &str, value: String| {
+                ui.label(egui::RichText::new(name).weak());
+                ui.label(egui::RichText::new(value).strong());
+                ui.end_row();
+            };
+            if let Some(f) = first {
+                row(&lang.t("Camera", "Камера"), f.camera.clone());
+            }
+            if let Some(f) = last {
+                row(&lang.t("Lens", "Объектив"), {
+                    let lens = f.lens.clone();
+                    if lens.is_empty() {
+                        "-".to_string()
+                    } else {
+                        lens
+                    }
+                });
+                row(&lang.t("Exposure", "Экспозиция"), f.exposure_line());
+                row(&lang.t("Time", "Время"), {
+                    let ts = f.timestamp.clone();
+                    if ts.is_empty() {
+                        "-".to_string()
+                    } else {
+                        ts
+                    }
+                });
+                row(
+                    &lang.t("Shutter count", "Счётчик затвора"),
+                    match f.shutter_count {
+                        Some(v) => v.to_string(),
+                        None => "-".to_string(),
+                    },
+                );
+            }
+            if let Some(f) = first {
+                row(
+                    &lang.t("Frame", "Кадр"),
+                    format!(
+                        "{} \u{00d7} {}  {}",
+                        f.width,
+                        f.height,
+                        f.cfa
+                    ),
+                );
+            }
+            row(
+                &lang.t("Series", "Серия"),
+                format!("{} {}", series.info.frame_count(), lang.t("frames", "кадров")),
+            );
+            if let Some(r) = series.result {
+                row(
+                    &lang.t("Result", "Результат"),
+                    format!("{} \u{00d7} {} ({:.1} MP)", r.width, r.height, r.megapixels()),
+                );
+            }
+        });
 }
 
 fn top_bar(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
@@ -174,6 +252,7 @@ fn top_bar(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
                 state.requests.push(Request::Quit);
             }
             ui.checkbox(&mut state.show_log, lang.t("log", "лог"));
+            ui.checkbox(&mut state.show_meta, lang.t("metadata", "метаданные"));
             ui.label(egui::RichText::new(crate::version()).weak());
         });
     });
@@ -228,18 +307,66 @@ fn series_tab(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
                 .color(demo_warning_color(ui)),
         );
     }
+    // The batch configuration table: source, frame count, resolved output
+    // scale, whose settings the merge will use, and whether the series takes
+    // part in the queue. Selecting a row shows the series.
     let mut select = None;
-    for (index, series) in state.series.iter().enumerate() {
-        let status = if series.loaded {
-            lang.t("merged", "объединено")
-        } else {
-            lang.t("idle", "ожидает")
-        };
-        let text = format!("{}  [{status}]", series.info.label());
-        if ui.selectable_label(index == state.selected, text).clicked() {
-            select = Some(index);
-        }
-    }
+    egui::Grid::new("pixelshift-series-table")
+        .striped(true)
+        .num_columns(5)
+        .spacing([10.0, 3.0])
+        .show(ui, |ui| {
+            for name in [
+                lang.t("Series", "Серии").to_owned(),
+                lang.t("Frames", "Кадры").to_owned(),
+                lang.t("scale", "масштаб").to_owned(),
+                lang.t("Settings", "Настройки").to_owned(),
+                lang.t("queued", "в очереди").to_owned(),
+            ] {
+                ui.label(egui::RichText::new(name).strong());
+            }
+            ui.end_row();
+            let scale_texts: Vec<String> = (0..state.series.len())
+                .map(|i| series_scale(state, i))
+                .collect();
+            for (index, series) in state.series.iter_mut().enumerate() {
+                let status = if series.loaded {
+                    lang.t("merged", "объединено")
+                } else {
+                    lang.t("idle", "ожидает")
+                };
+                let own = if series.pinned.is_some() { " \u{2605}" } else { "" };
+                let selected = index == state.selected;
+                let label = egui::RichText::new(format!("{}{own}  [{status}]", series.info.label()))
+                    .strong();
+                if ui
+                    .selectable_label(selected, label)
+                    .on_hover_text(series.info.dir.display().to_string())
+                    .clicked()
+                {
+                    select = Some(index);
+                }
+                ui.label(format!("{}", series.info.frame_count()));
+                ui.label(&scale_texts[index]);
+                ui.label(if series.pinned.is_some() {
+                    lang.t("own", "свои")
+                } else {
+                    lang.t("global", "общие")
+                });
+                if ui
+                    .checkbox(&mut series.queued, "")
+                    .on_hover_text(lang.t(
+                        "take part in the batch queue",
+                        "участвовать в пакетной обработке",
+                    ))
+                    .changed()
+                    && !series.queued
+                {
+                    state.queue.retain(|&q| q != index);
+                }
+                ui.end_row();
+            }
+        });
     if state.series.is_empty() {
         ui.label(lang.t("no series loaded", "серии не загружены"));
     }
@@ -255,14 +382,16 @@ fn series_tab(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
     }
     let queued = state.queue.len();
     ui.horizontal(|ui| {
+        let queueable = (0..state.series.len()).filter(|&i| state.series[i].queued);
+        let queueable = queueable.collect::<Vec<_>>();
         if ui
             .add_enabled(
-                !state.series.is_empty(),
+                !queueable.is_empty(),
                 egui::Button::new(lang.t("queue all", "в очередь все")),
             )
             .clicked()
         {
-            state.queue = (0..state.series.len()).collect();
+            state.queue = queueable;
         }
         if ui
             .add_enabled(
@@ -276,12 +405,85 @@ fn series_tab(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
         ui.label(format!("{queued} {}", lang.t("queued", "в очереди")));
     });
 
+    // Per-series settings: a pinned snapshot lets the queue run a whole
+    // folder of mixed subjects without attention.
+    if let Some(index) = state.selected_series_index() {
+        let pinned = state.series[index].pinned.is_some();
+        let mut toggled = pinned;
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(
+                    &mut toggled,
+                    lang.t("own merge settings", "свои параметры слияния"),
+                )
+                .changed()
+            {
+                state.requests.push(Request::SetPinned {
+                    index,
+                    pinned: toggled,
+                });
+            }
+        });
+        if let Some(p) = state.series[index].pinned.clone() {
+            ui.label(
+                egui::RichText::new(settings_summary(&p))
+                    .small()
+                    .weak(),
+            );
+            if ui
+                .button(lang.t("re-snapshot current settings", "взять текущие параметры"))
+                .clicked()
+            {
+                state.requests.push(Request::SetPinned {
+                    index,
+                    pinned: true,
+                });
+            }
+        }
+    }
+
     ui.separator();
     frames_panel(state, lang, ui);
 }
 
+/// Resolved output scale of one series under the settings it will merge with.
+fn series_scale(state: &GuiState, index: usize) -> String {
+    let Some(series) = state.series.get(index) else {
+        return "-".to_string();
+    };
+    let options = state.series_options(index);
+    options
+        .scale
+        .resolve(series.info.frame_count(), series.info.suggested_scale)
+        .to_string()
+}
+
+/// One line summary of what a pinned snapshot contains.
+fn settings_summary(o: &crate::app::model::EditOptions) -> String {
+    let mut parts = vec![o.scale.label().to_string(), o.format.label().to_string()];
+    if o.stabilize {
+        parts.push("stabilize".into());
+    }
+    if o.motion_enabled {
+        parts.push(format!("motion x{:.2}", o.motion_sensitivity));
+    }
+    if o.deconvolve != 0.0 {
+        parts.push(format!("deconv {:.1}", o.deconvolve));
+    }
+    parts.join(" \u{00b7} ")
+}
+
 fn frames_panel(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
-    ui.heading(lang.t("Frames", "Кадры"));
+    // Technical detail (shifts, residuals, mask shares): collapsed unless
+    // asked for. egui remembers the toggle for the session.
+    egui::CollapsingHeader::new(lang.t("Frames", "Кадры"))
+        .default_open(false)
+        .id_salt("pixelshift-frames-header")
+        .show(ui, |ui| frames_panel_body(state, lang, ui));
+}
+
+fn frames_panel_body(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
     let selected_frame = state.selected_frame;
     let (frames, shifts) = match state.selected_series() {
         Some(series) => (series.frames.clone(), series.shifts.clone()),
@@ -617,7 +819,7 @@ fn options_panel(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
             estimate.scale,
             estimate.megapixels()
         ));
-        ui.label(output_size_line(state, lang, &estimate));
+        ui.label(egui::RichText::new(output_size_line(state, lang, &estimate)).strong());
         if let Some((needed, free)) = state.space_shortfall() {
             let _ = needed;
             ui.label(
@@ -718,10 +920,10 @@ fn bottom_panel(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
                 .desired_width(240.0)
                 .show_percentage(),
         );
-        ui.label(format!(
-            "{:.0} ms",
-            state.total_time().as_secs_f64() * 1000.0
-        ));
+        ui.label(egui::RichText::new(pipeline::fmt_duration(
+            (state.total_time().as_secs_f64() * 1000.0) as u64,
+        ))
+        .strong());
         if state.crop_pending {
             ui.spinner();
         }
@@ -757,24 +959,29 @@ fn bottom_panel(state: &mut GuiState, lang: Lang, ui: &mut egui::Ui) {
     }
     if let Some(series) = state.selected_series() {
         if let Some(result) = series.result {
-            ui.label(format!(
-                "{} {} x {}  {} {}  {:.2} MP  white {}",
-                lang.t("result", "результат"),
-                result.width,
-                result.height,
-                lang.t("scale", "масштаб"),
-                result.scale,
-                result.megapixels(),
-                result.white
-            ));
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} {} x {}  {} {}  {:.2} MP",
+                    lang.t("result", "результат"),
+                    result.width,
+                    result.height,
+                    lang.t("scale", "масштаб"),
+                    result.scale,
+                    result.megapixels(),
+                ))
+                .strong(),
+            );
         }
         for (path, bytes) in &series.saved {
-            ui.label(format!(
-                "{} {} ({})",
-                lang.t("saved", "сохранено"),
-                path.display(),
-                pipeline::fmt_bytes(*bytes)
-            ));
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} {} ({})",
+                    lang.t("saved", "сохранено"),
+                    path.display(),
+                    pipeline::fmt_bytes(*bytes)
+                ))
+                .strong(),
+            );
         }
     }
     if state.show_log {
@@ -829,14 +1036,45 @@ fn canvas(state: &mut GuiState, cache: &mut PreviewCache, lang: Lang, ui: &mut e
     painter.rect_filled(rect, 0.0, Color32::from_rgb(18, 18, 20));
 
     let Some(dims) = state.image_size() else {
+        // Nothing to show yet: turn the whole canvas into a large
+        // drag-and-drop field next to the Open buttons.
+        let hovering = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+        let inner = rect.shrink2(egui::vec2(60.0, 50.0));
+        let accent = if hovering {
+            Color32::from_rgb(120, 180, 250)
+        } else {
+            Color32::from_rgb(90, 90, 110)
+        };
+        painter.rect_filled(inner, 12.0, Color32::from_rgb(26, 26, 30));
+        painter.rect_stroke(
+            inner,
+            12.0,
+            egui::Stroke::new(if hovering { 2.5 } else { 1.5 }, accent),
+            egui::StrokeKind::Inside,
+        );
+        let title = if hovering {
+            lang.t("drop to open", "отпустите, чтобы открыть")
+        } else {
+            lang.t(
+                "drag a folder or raw files here",
+                "перетащите сюда папку или raw-файлы",
+            )
+        };
         painter.text(
-            rect.center(),
+            inner.center() - Vec2::new(0.0, 16.0),
+            egui::Align2::CENTER_CENTER,
+            title,
+            egui::FontId::proportional(22.0),
+            if hovering { accent } else { Color32::from_rgb(200, 200, 210) },
+        );
+        painter.text(
+            inner.center() + Vec2::new(0.0, 14.0),
             egui::Align2::CENTER_CENTER,
             lang.t(
-                "no merged image yet: open a folder and press Merge",
-                "объединённого изображения ещё нет: откройте папку и нажмите «Объединить»",
+                "Pixel Shift series are detected automatically; \u{2191} / \u{2193} or \u{21d5} to add more",
+                "Серии Pixel Shift распознаются автоматически; можно добавить несколько",
             ),
-            egui::FontId::proportional(16.0),
+            egui::FontId::proportional(13.0),
             Color32::GRAY,
         );
         return;

@@ -196,6 +196,65 @@ pub fn makernote(path: &Path) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Shutter count of one Nikon raw file: the Nikon3 maker note is an embedded
+/// TIFF after the "Nikon\0" + version header, and its tag 0x00A7 carries the
+/// counter. None when the note is absent, not embedded-TIFF style, or the
+/// tag is missing.
+pub fn shutter_count(path: &Path) -> Option<u64> {
+    shutter_count_from_note(&makernote(path)?)
+}
+
+fn shutter_count_from_note(note: &[u8]) -> Option<u64> {
+    // "Nikon\0" + 4 version bytes + TIFF header (II/MM, magic, IFD offset
+    // relative to the header start).
+    if note.len() < 18 || &note[..6] != b"Nikon\0" {
+        return None;
+    }
+    let little = match &note[10..12] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let rd_u16 = |o: usize| -> Option<u16> {
+        note.get(o..o + 2).map(|b| {
+            if little {
+                u16::from_le_bytes([b[0], b[1]])
+            } else {
+                u16::from_be_bytes([b[0], b[1]])
+            }
+        })
+    };
+    let rd_u32 = |o: usize| -> Option<u32> {
+        note.get(o..o + 4).map(|b| {
+            if little {
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            } else {
+                u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+            }
+        })
+    };
+    let ifd = 10 + rd_u32(14)? as usize;
+    let entries = rd_u16(ifd)? as usize;
+    for e in 0..entries {
+        let base = ifd + 2 + 12 * e;
+        let tag = rd_u16(base)?;
+        if tag == 0x00a7 {
+            let kind = rd_u16(base + 2)?;
+            let count = rd_u32(base + 4)? as usize;
+            if count != 1 {
+                return None;
+            }
+            return match kind {
+                4 => rd_u32(base + 8).map(|v| v as u64),
+                3 => rd_u16(base + 8).map(|v| v as u64),
+                1 => note.get(base + 8).map(|&v| v as u64),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
 /// Make and Model exactly as written in IFD0 of a TIFF based raw file.
 ///
 /// Only the 12 bytes of each matching IFD entry and the string itself are read,
@@ -432,4 +491,43 @@ fn push_run(dir: &Path, run: &mut Vec<PathBuf>, out: &mut Vec<Series>) {
         remaining -= n;
     }
     run.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shutter_count_from_note;
+
+    /// Nikon3 style maker note: "Nikon\0" + version + an embedded little
+    /// endian TIFF whose IFD carries tag 0x00A7.
+    fn note(count: u32) -> Vec<u8> {
+        let mut n = b"Nikon\0".to_vec();
+        n.extend_from_slice(b"0100");
+        n.extend_from_slice(b"II\x2a\x00");
+        n.extend_from_slice(&8u32.to_le_bytes());
+        let ifd = n.len();
+        n.extend_from_slice(&1u16.to_le_bytes());
+        n.extend_from_slice(&0x00a7u16.to_le_bytes());
+        n.extend_from_slice(&4u16.to_le_bytes()); // LONG
+        n.extend_from_slice(&1u32.to_le_bytes());
+        n.extend_from_slice(&count.to_le_bytes());
+        n.extend_from_slice(&0u32.to_le_bytes());
+        let _ = ifd;
+        n
+    }
+
+    #[test]
+    fn shutter_count_is_read_from_the_nikon_note() {
+        assert_eq!(shutter_count_from_note(&note(123_456)), Some(123_456));
+        assert_eq!(shutter_count_from_note(&note(1)), Some(1));
+    }
+
+    #[test]
+    fn foreign_notes_are_rejected() {
+        assert_eq!(shutter_count_from_note(b"\x00\x01\x02"), None);
+        assert_eq!(shutter_count_from_note(&note(5)[..14]), None);
+        let mut other = note(5);
+        other[10] = b'M';
+        other[11] = b'M';
+        assert_eq!(shutter_count_from_note(&other), None);
+    }
 }

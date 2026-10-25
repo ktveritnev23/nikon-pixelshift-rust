@@ -257,6 +257,12 @@ pub struct FrameInfo {
     pub aperture: f32,
     pub focal: f32,
     pub camera: String,
+    /// EXIF DateTimeOriginal as written in the file.
+    pub timestamp: String,
+    /// Lens make + model, empty when the file records none.
+    pub lens: String,
+    /// Nikon shutter count from the maker note, None when unavailable.
+    pub shutter_count: Option<u64>,
 }
 
 impl FrameInfo {
@@ -298,6 +304,15 @@ pub struct SeriesView {
     pub stats: Option<MergeStats>,
     pub loaded: bool,
     pub saved: Vec<(PathBuf, u64)>,
+    /// Settings pinned for this series: the queue and the manual merge use
+    /// them instead of the global ones, so a long batch needs no attention.
+    /// None = follow the current global settings.
+    pub pinned: Option<EditOptions>,
+    /// Takes part in the batch queue (checkbox in the series list).
+    pub queued: bool,
+    /// Preview of the first frame, shown on the canvas before the series is
+    /// merged ("is this frame worth merging at all?").
+    pub first_preview: Option<PreviewSlot>,
 }
 
 impl SeriesView {
@@ -310,6 +325,9 @@ impl SeriesView {
             stats: None,
             loaded: false,
             saved: Vec::new(),
+            pinned: None,
+            queued: true,
+            first_preview: None,
         }
     }
 
@@ -328,6 +346,17 @@ pub struct PreviewSlot {
     pub rect: Option<(usize, usize, usize, usize)>,
     pub step: u32,
     pub generation: u64,
+}
+
+impl std::fmt::Debug for PreviewSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreviewSlot")
+            .field("source", &self.source)
+            .field("rect", &self.rect)
+            .field("step", &self.step)
+            .field("generation", &self.generation)
+            .finish()
+    }
 }
 
 /// A crop the canvas wants: image rectangle (full resolution coordinates,
@@ -418,6 +447,17 @@ pub enum Request {
     Distort {
         distort: crate::distort::Distortion,
     },
+    /// Snapshot the current global settings as this series' own (true) or
+    /// return it to following the global ones (false).
+    SetPinned {
+        index: usize,
+        pinned: bool,
+    },
+    /// Decode the first file of a series and show its preview on the canvas.
+    PreviewFirst {
+        index: usize,
+        path: PathBuf,
+    },
     PickDistortReference,
     SaveDialog {
         downsample: bool,
@@ -455,6 +495,8 @@ pub struct GuiState {
     pub stage_log: Vec<(Stage, Duration)>,
     pub auto_run: bool,
     pub show_log: bool,
+    /// Right metadata panel visibility.
+    pub show_meta: bool,
     pub free_space: Option<u64>,
     stage_started: Option<Instant>,
     generation: u64,
@@ -499,9 +541,18 @@ impl GuiState {
             stage_log: Vec::new(),
             auto_run: mode == Mode::Demo,
             show_log: false,
+            show_meta: true,
             free_space: None,
             stage_started: None,
             generation: 0,
+        }
+    }
+
+    pub fn selected_series_index(&self) -> Option<usize> {
+        if self.selected < self.series.len() {
+            Some(self.selected)
+        } else {
+            None
         }
     }
 
@@ -705,6 +756,16 @@ impl GuiState {
                 self.progress = 0.0;
                 self.enter_stage(Stage::Idle);
                 self.push_log(format!("found {} series", self.series.len()));
+                // First-frame previews: the canvas shows each series before
+                // any merge ("worth merging at all?").
+                for (index, series) in self.series.iter().enumerate() {
+                    if let Some(path) = series.info.files.first() {
+                        self.requests.push(Request::PreviewFirst {
+                            index,
+                            path: path.clone(),
+                        });
+                    }
+                }
                 if self.auto_run && !self.series.is_empty() {
                     self.auto_run = false;
                     self.requests.push(Request::Load);
@@ -820,6 +881,15 @@ impl GuiState {
                 self.last_fit = Some(report);
                 self.options.distort = report.distortion();
             }
+            Event::FirstPreview { index, slot } => {
+                self.generation += 1;
+                if let Some(series) = self.series.get_mut(index) {
+                    series.first_preview = Some(PreviewSlot {
+                        generation: self.generation,
+                        ..slot
+                    });
+                }
+            }
             Event::Error(message) => self.fail(message),
         }
     }
@@ -855,6 +925,15 @@ impl GuiState {
         let mut info = pipeline::expected_output(frame.width, frame.height, scale);
         info.white = series.result.map(|r| r.white).unwrap_or(0);
         Some(info)
+    }
+
+    /// Settings a series merges with: its pinned snapshot when present,
+    /// otherwise the current global ones.
+    pub fn series_options(&self, index: usize) -> EditOptions {
+        self.series
+            .get(index)
+            .and_then(|s| s.pinned.clone())
+            .unwrap_or_else(|| self.options.clone())
     }
 
     /// (needed bytes, free bytes) when the output would not fit on disk.
@@ -990,6 +1069,55 @@ pub fn clamp_center(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn unqueued_series_are_skipped_by_the_batch_filters() {
+        let mut state = GuiState::new(Mode::Demo);
+        state.series = vec![
+            SeriesView::new(crate::app::demo::series()),
+            SeriesView::new(crate::app::demo::series()),
+            SeriesView::new(crate::app::demo::series()),
+        ];
+        state.series[1].queued = false;
+        let queueable: Vec<usize> = (0..state.series.len())
+            .filter(|&i| state.series[i].queued)
+            .collect();
+        assert_eq!(queueable, vec![0, 2]);
+        // An unqueued index that slipped into the queue is skipped, not merged.
+        state.queue = vec![1, 2];
+        state.batch_running = true;
+        assert_eq!(state.queue.len(), 2);
+        // (the skip itself lives in advance_batch, exercised in the selftest)
+    }
+
+    #[test]
+    fn pinned_settings_win_over_the_global_ones() {
+        let frames = crate::app::demo::frames();
+        let result = crate::app::demo::result(1, &frames);
+        let mut series = SeriesView::new(crate::app::demo::series());
+        series.result = Some(ResultInfo {
+            width: result.width,
+            height: result.height,
+            scale: 1,
+            white: result.white,
+        });
+        let mut state = GuiState::new(Mode::Demo);
+        state.series = vec![series];
+        state.options.format = OutFormat::Tiff;
+        assert_eq!(state.series_options(0).format, OutFormat::Tiff);
+        let mut own = state.options.clone();
+        own.format = OutFormat::Dng;
+        own.motion_enabled = true;
+        state.series[0].pinned = Some(own);
+        let effective = state.series_options(0);
+        assert_eq!(effective.format, OutFormat::Dng);
+        assert!(effective.motion_enabled);
+        // Other series still follow the globals.
+        state.series.push(SeriesView::new(crate::app::demo::series()));
+        assert_eq!(state.series_options(1).format, OutFormat::Tiff);
+    }
+
     use super::*;
 
     #[test]

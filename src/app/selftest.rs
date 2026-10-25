@@ -446,7 +446,11 @@ impl Report {
             if !line.is_empty() {
                 line.push_str(" | ");
             }
-            line.push_str(&format!("{} {:.0} ms", stage.label(), ms(*elapsed)));
+            line.push_str(&format!(
+                "{} {}",
+                stage.label(),
+                pipeline::fmt_duration(ms(*elapsed) as u64)
+            ));
         }
         if !line.is_empty() {
             println!("  stages: {line}");
